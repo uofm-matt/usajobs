@@ -1,0 +1,41 @@
+[project]
+name = "usajobs"
+version = "0.1.0"
+description = "USAJobs federal job listing map and search application"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "asyncpg>=0.30",
+    "slowapi>=0.1.9",
+    "pydantic-settings>=2.7",
+    "psycopg2-binary>=2.9",
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-p no:anyio"
+
+[tool.coverage.run]
+source = ["backend", "collect"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"

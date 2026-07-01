@@ -1,0 +1,9 @@
+data/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.venv/
+.coverage
+Locality Pay Area Definitions.html
+Locality Pay Area Definitions_files/

@@ -1,0 +1,12 @@
+.env
+.env.*
+__pycache__
+*.pyc
+*.egg-info
+.venv
+data/
+tests/
+migrations/
+schema.sql
+.git
+*.md

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>USAJobs Map</title>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+    <div id="map"></div>
+
+    <!-- Filter panel -->
+    <div id="filter-panel">
+        <div class="filter-header">
+            <span class="filter-title">Filters</span>
+            <div id="view-toggle">
+                <button id="view-map" class="view-btn active" title="Map view">Map</button>
+                <button id="view-list" class="view-btn" title="List view">List</button>
+            </div>
+            <button id="filter-toggle" title="Collapse filters">&lsaquo;</button>
+        </div>
+        <div class="filter-body">
+            <label for="filter-keyword">Keyword</label>
+            <input type="text" id="filter-keyword" placeholder="e.g. IT Specialist">
+
+            <label for="filter-department">Department</label>
+            <select id="filter-department"><option value="">All departments</option></select>
+
+            <label for="filter-agency">Agency</label>
+            <select id="filter-agency"><option value="">All agencies</option></select>
+
+            <label for="filter-series">Job Series</label>
+            <select id="filter-series"><option value="">All series</option></select>
+
+            <label for="filter-clearance">Clearance</label>
+            <select id="filter-clearance"><option value="">Any clearance</option></select>
+
+            <label for="filter-locality">Locality Pay Area</label>
+            <select id="filter-locality"><option value="">All locality areas</option></select>
+            <label class="filter-checkbox-label">
+                <input type="checkbox" id="filter-exclude-ncr"> Exclude NCR (DC metro area)
+            </label>
+            <label class="filter-checkbox-label">
+                <input type="checkbox" id="filter-exclude-registers" checked> Hide nationwide / open-continuous registers
+            </label>
+            <label class="filter-checkbox-label">
+                <input type="checkbox" id="filter-exclude-providers"> Hide clinical providers (physicians, therapists, counselors)
+            </label>
+
+            <label for="filter-state">State</label>
+            <select id="filter-state"><option value="">All states</option></select>
+
+            <label for="filter-country">Country</label>
+            <select id="filter-country"><option value="">All countries</option></select>
+
+            <label for="filter-city">City</label>
+            <select id="filter-city"><option value="">All cities</option></select>
+
+            <label>Grade (GS)</label>
+            <div class="filter-range">
+                <input type="number" id="filter-grade-min" min="1" max="15" placeholder="Min">
+                <span>&ndash;</span>
+                <input type="number" id="filter-grade-max" min="1" max="15" placeholder="Max">
+            </div>
+
+            <label>Salary ($)</label>
+            <div class="filter-range">
+                <input type="number" id="filter-salary-min" min="0" step="1000" placeholder="Min">
+                <span>&ndash;</span>
+                <input type="number" id="filter-salary-max" min="0" step="1000" placeholder="Max">
+            </div>
+
+            <button id="filter-clear" class="filter-clear-btn">Clear all</button>
+        </div>
+    </div>
+
+    <!-- Detail panel -->
+    <div id="detail-panel">
+        <div class="detail-header">
+            <button id="detail-close" title="Close">&times;</button>
+        </div>
+        <div id="detail-loading" class="detail-loading">Loading&hellip;</div>
+        <div id="detail-content" style="display:none">
+            <h2 id="detail-title"></h2>
+            <p id="detail-org" class="detail-org"></p>
+            <p id="detail-dept" class="detail-dept"></p>
+
+            <div class="detail-meta">
+                <div class="detail-meta-item">
+                    <span class="meta-label">Salary</span>
+                    <span id="detail-salary"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Grade</span>
+                    <span id="detail-grade"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Location</span>
+                    <span id="detail-location"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Clearance</span>
+                    <span id="detail-clearance"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Open/Close</span>
+                    <span id="detail-dates"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Travel</span>
+                    <span id="detail-travel"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Telework</span>
+                    <span id="detail-telework"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Promotion</span>
+                    <span id="detail-promo"></span>
+                </div>
+                <div class="detail-meta-item">
+                    <span class="meta-label">Hiring paths</span>
+                    <span id="detail-hiring"></span>
+                </div>
+            </div>
+
+            <div class="detail-actions">
+                <a id="detail-apply" class="detail-btn detail-btn-primary" href="#" target="_blank" rel="noopener">Apply</a>
+                <a id="detail-view" class="detail-btn" href="#" target="_blank" rel="noopener">View on USAJobs</a>
+            </div>
+
+            <div class="detail-section"><h3>Summary</h3><p id="detail-summary"></p></div>
+            <div class="detail-section"><h3>Major Duties</h3><p id="detail-duties"></p></div>
+            <div class="detail-section"><h3>Education</h3><p id="detail-education"></p></div>
+            <div class="detail-section"><h3>Requirements</h3><p id="detail-requirements"></p></div>
+            <div class="detail-section"><h3>Evaluations</h3><p id="detail-evaluations"></p></div>
+            <div class="detail-section"><h3>How to Apply</h3><p id="detail-how-to-apply"></p></div>
+        </div>
+    </div>
+
+    <!-- List view -->
+    <div id="list-panel" style="display:none">
+        <div id="list-header">
+            <span id="list-count"></span>
+            <div id="list-sort">
+                <select id="list-sort-field">
+                    <option value="close_date">Close Date</option>
+                    <option value="salary" selected>Salary</option>
+                    <option value="grade">Grade</option>
+                    <option value="title">Title</option>
+                    <option value="org">Agency</option>
+                    <option value="series">Series</option>
+                    <option value="location">Location</option>
+                </select>
+                <button id="list-sort-order" title="Toggle sort order">&uarr;</button>
+            </div>
+        </div>
+        <div id="list-body"></div>
+        <div id="list-pagination"></div>
+    </div>
+
+    <div id="loading">Loading jobs&hellip;</div>
+    <div id="job-count"></div>
+    <div id="toast"></div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script type="module" src="/js/app.js"></script>
+    <script type="module" src="/js/list.js"></script>
+</body>
+</html>
