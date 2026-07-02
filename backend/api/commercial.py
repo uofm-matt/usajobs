@@ -11,7 +11,7 @@ from fastapi import APIRouter, Query, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from backend.api.filters import _parse_bbox
+from backend.api.filters import NCR_LOCALITY, _parse_bbox
 from backend.db import get_pool
 
 limiter = Limiter(key_func=get_remote_address)
@@ -57,82 +57,6 @@ def _label_expr(t: str) -> str:
     )
 
 
-# Practical "DC commute" definition for exclude_ncr: the National Capital Region
-# proper plus the Fort Meade corridor (BW Parkway / Anne Arundel). Lowercased to
-# match against lower(addressLocality). VA/MD only — DC itself is caught by region.
-# Tunable: add/remove suburbs here without touching the query.
-NCR_CITIES = [
-    # Northern Virginia
-    "arlington",
-    "alexandria",
-    "falls church",
-    "fairfax",
-    "mclean",
-    "tysons",
-    "tysons corner",
-    "vienna",
-    "oakton",
-    "merrifield",
-    "reston",
-    "herndon",
-    "chantilly",
-    "centreville",
-    "springfield",
-    "annandale",
-    "burke",
-    "ashburn",
-    "sterling",
-    "dulles",
-    "leesburg",
-    "manassas",
-    "manassas park",
-    "gainesville",
-    "haymarket",
-    "woodbridge",
-    "lorton",
-    "dumfries",
-    "fort belvoir",
-    "ft. belvoir",
-    "quantico",
-    "stafford",
-    # Suburban Maryland + Fort Meade corridor
-    "bethesda",
-    "chevy chase",
-    "rockville",
-    "gaithersburg",
-    "germantown",
-    "silver spring",
-    "wheaton",
-    "college park",
-    "greenbelt",
-    "beltsville",
-    "adelphi",
-    "laurel",
-    "columbia",
-    "fort meade",
-    "ft. meade",
-    "ft meade",
-    "annapolis junction",
-    "hanover",
-    "jessup",
-    "odenton",
-    "severn",
-    "linthicum",
-    "linthicum heights",
-    "elkridge",
-    "lanham",
-    "hyattsville",
-    "landover",
-    "largo",
-    "upper marlboro",
-    "bowie",
-    "suitland",
-    "camp springs",
-    "andrews afb",
-    "joint base andrews",
-]
-
-
 def _sort_exprs(d: str, order: str = "desc") -> dict[str, str]:
     """Whitelisted ORDER BY expressions over the JobPosting jsonb at column `d`.
 
@@ -159,6 +83,71 @@ def _sort_exprs(d: str, order: str = "desc") -> dict[str, str]:
             f"{d}->'jobLocation'->'address'->>'addressLocality')"
         ),
     }
+
+
+# Full state / territory names → USPS codes, so a location search for "colorado"
+# reaches jobs stored with region "CO". Mirrors cj_collect.py US_STATE_TO_USPS
+# (the collector normalizes on write; this expands on read for the free-text box).
+_STATE_NAME_TO_CODE = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+    "district of columbia": "DC",
+    "washington dc": "DC",
+    "washington d.c.": "DC",
+    "puerto rico": "PR",
+    "guam": "GU",
+    "virgin islands": "VI",
+    "american samoa": "AS",
+    "northern mariana islands": "MP",
+}
 
 
 def _build_where(
@@ -222,27 +211,35 @@ def _build_where(
     if location:
         params.append(f"%{location}%")
         n = len(params)
+        matches = [
+            f"loc->'address'->>'addressLocality' ILIKE ${n}",
+            f"loc->'address'->>'addressRegion' ILIKE ${n}",
+        ]
+        # "colorado" never appears in the data (postings store "CO"), so a typed
+        # state name expands to an exact region match.
+        if code := _STATE_NAME_TO_CODE.get(location.strip().lower()):
+            params.append(code)
+            matches.append(f"loc->'address'->>'addressRegion' = ${len(params)}")
         clauses.append(
             f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
-            f"WHERE loc->'address'->>'addressLocality' ILIKE ${n} "
-            f"OR loc->'address'->>'addressRegion' ILIKE ${n})"
+            f"WHERE {' OR '.join(matches)})"
         )
     if exclude_ncr:
-        params.append(NCR_CITIES)
+        params.append(NCR_LOCALITY)
         n = len(params)
-        # Keep a job unless *every* location is NCR: EXISTS a location that is NOT
-        # NCR. The COALESCEs are load-bearing — a location with null region/city
-        # coalesces to '' (non-NCR), so it satisfies the NOT and keeps the job
-        # rather than dropping out of the predicate via NULL. A missing jobLocation
-        # normalizes to [null] (see _JOB_LOCATIONS): its lone element's
-        # loc->'address' is NULL → coalesced to '' → non-NCR → job kept.
+        # NCR = the OPM DC locality-pay area, resolved per geocoded location and
+        # materialized on job_locations (migration 11) — the authoritative,
+        # county-based definition public.jobs_geo uses, so spelling variants
+        # ("Fort Meade" vs "Fort George G Meade") don't matter. Keep a job unless
+        # *every* geocoded location is in that locality: it survives if it has any
+        # location elsewhere or un-geocoded (IS DISTINCT FROM treats NULL as
+        # non-NCR), or has no location rows at all.
         clauses.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
-            "WHERE NOT ("
-            "COALESCE(loc->'address'->>'addressRegion', '') = 'DC' "
-            "OR (COALESCE(loc->'address'->>'addressRegion', '') IN ('VA', 'MD') "
-            f"AND lower(COALESCE(loc->'address'->>'addressLocality', '')) = ANY(${n})"
-            ")))"
+            "(EXISTS (SELECT 1 FROM commercial.job_locations lo "
+            "WHERE lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id "
+            f"AND lo.locality_area IS DISTINCT FROM ${n}) "
+            "OR NOT EXISTS (SELECT 1 FROM commercial.job_locations lo2 "
+            "WHERE lo2.source = jobs_raw.source AND lo2.ext_id = jobs_raw.ext_id))"
         )
     if loc:
         params.append(loc)

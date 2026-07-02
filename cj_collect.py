@@ -458,6 +458,20 @@ def _geocode(cur, loc: dict) -> tuple[float | None, float | None, str | None]:
     return None, None, None
 
 
+def _resolve_locality(cur, lat: float, lon: float) -> tuple[str | None, str | None]:
+    """Point-in-polygon a geocoded location to its county FIPS + OPM locality-pay
+    area, mirroring how public.jobs_geo derives locality_area. (None, None) when the
+    point falls in no county (non-US or offshore)."""
+    cur.execute(
+        "SELECT c.fips, la.locality FROM public.us_counties c "
+        "LEFT JOIN public.locality_areas la ON la.fips = c.fips "
+        "WHERE ST_Contains(c.geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) LIMIT 1",
+        (lon, lat),
+    )
+    row = cur.fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
 def _write_job_locations(cur, ext_id: str, posting: dict) -> list[str | None]:
     """Rebuild commercial.job_locations for one posting: delete the prior rows, then
     insert one geocoded row per normalized jobLocation. Returns the per-row methods."""
@@ -473,10 +487,16 @@ def _write_job_locations(cur, ext_id: str, posting: dict) -> list[str | None]:
     methods: list[str | None] = []
     for seq, loc in enumerate(locations):
         lat, lon, method = _geocode(cur, loc)
+        county_fips, locality_area = (
+            _resolve_locality(cur, lat, lon)
+            if lat is not None and lon is not None
+            else (None, None)
+        )
         cur.execute(
             "INSERT INTO commercial.job_locations "
             "(source, ext_id, seq, city, region, country, postal, lat, lon, "
-            "geocode_method) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "geocode_method, county_fips, locality_area) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 SOURCE,
                 ext_id,
@@ -488,6 +508,8 @@ def _write_job_locations(cur, ext_id: str, posting: dict) -> list[str | None]:
                 lat,
                 lon,
                 method,
+                county_fips,
+                locality_area,
             ),
         )
         methods.append(method)

@@ -14,6 +14,8 @@ FIXTURE = (Path(__file__).parent / "fixtures" / "cj_detail_sample.html").read_te
     encoding="utf-8"
 )
 
+_NCR = "Washington-Baltimore-Arlington, DC-MD-VA-WV-PA"
+
 
 def _cursor_conn():
     """A conn whose .cursor() works both as context manager and plain call."""
@@ -725,9 +727,15 @@ class TestWriteJobLocations:
                 _place(addressLocality="stuttgart", addressCountry="Germany"),
             ]
         }
-        with patch(
-            "cj_collect._geocode",
-            side_effect=[(1.0, 2.0, "zip"), (3.0, 4.0, "city")],
+        with (
+            patch(
+                "cj_collect._geocode",
+                side_effect=[(1.0, 2.0, "zip"), (3.0, 4.0, "city")],
+            ),
+            patch(
+                "cj_collect._resolve_locality",
+                side_effect=[("51059", _NCR), (None, None)],
+            ),
         ):
             methods = cj_collect._write_job_locations(cur, "42", posting)
         assert methods == ["zip", "city"]
@@ -746,6 +754,8 @@ class TestWriteJobLocations:
             1.0,
             2.0,
             "zip",
+            "51059",
+            _NCR,
         )
         assert ins1.args[1] == (
             "clearancejobs",
@@ -758,7 +768,36 @@ class TestWriteJobLocations:
             3.0,
             4.0,
             "city",
+            None,
+            None,
         )
+
+    def test_ungeocoded_location_skips_locality_resolve(self):
+        cur = MagicMock()
+        posting = {
+            "jobLocation": _place(addressLocality="Nowhere", addressCountry="Narnia")
+        }
+        with (
+            patch("cj_collect._geocode", return_value=(None, None, None)),
+            patch("cj_collect._resolve_locality") as resolve,
+        ):
+            cj_collect._write_job_locations(cur, "9", posting)
+        resolve.assert_not_called()
+        # county_fips + locality_area land as NULL when there is no point to resolve.
+        assert cur.execute.call_args_list[1].args[1][-2:] == (None, None)
+
+    def test_resolve_locality_point_in_polygon(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = ("24003", _NCR)
+        assert cj_collect._resolve_locality(cur, 39.108, -76.743) == ("24003", _NCR)
+        sql, params = cur.execute.call_args.args
+        assert "ST_Contains" in sql and "us_counties" in sql
+        assert params == (-76.743, 39.108)  # (lon, lat) order into ST_MakePoint
+
+    def test_resolve_locality_no_county_match(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        assert cj_collect._resolve_locality(cur, 0.0, 0.0) == (None, None)
 
     def test_single_dict_location_handled(self):
         cur = MagicMock()

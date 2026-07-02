@@ -12,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock
 
 from backend.api.commercial import (
-    NCR_CITIES,
+    NCR_LOCALITY,
     _build_where,
     _item,
     _label_expr,
@@ -166,6 +166,21 @@ class TestBuildWhere:
         assert "like_regex" not in where
         assert params == ["%Denver%"]
 
+    def test_location_expands_state_name_to_region_code(self):
+        # "colorado" isn't a substring of the stored "CO"/"Denver", so a full
+        # state name expands to an exact region match on its USPS code.
+        where, params = _build_where(location="Colorado")
+        assert "loc->'address'->>'addressLocality' ILIKE $1" in where
+        assert "loc->'address'->>'addressRegion' ILIKE $1" in where
+        assert "loc->'address'->>'addressRegion' = $2" in where
+        assert params == ["%Colorado%", "CO"]
+
+    def test_location_non_state_binds_no_extra_param(self):
+        # A city name that isn't a state leaves the clause single-param.
+        where, params = _build_where(location="Denver")
+        assert "addressRegion' = $2" not in where
+        assert params == ["%Denver%"]
+
     def test_location_placeholder_sequential_after_other_filters(self):
         where, params = _build_where(
             clearance=["Secret"], company="X", q="y", location="Denver"
@@ -185,20 +200,17 @@ class TestBuildWhere:
         assert params == []
         assert "= ANY(" not in where
 
-    def test_exclude_ncr_keeps_jobs_with_any_non_ncr_location(self):
+    def test_exclude_ncr_filters_on_materialized_locality(self):
         where, params = _build_where(exclude_ncr=True)
-        # Keep a job unless EVERY location is NCR: EXISTS a location that is NOT
-        # (DC, or a VA/MD locality in the city list).
-        assert "jsonb_typeof(data->'jobLocation') = 'array'" in where
-        assert "ELSE jsonb_build_array(data->'jobLocation') END" in where
-        assert "WHERE NOT (" in where
-        assert "COALESCE(loc->'address'->>'addressRegion', '') = 'DC'" in where
-        assert "IN ('VA', 'MD')" in where
-        # Single bound param carrying the whole city list, matched with = ANY.
-        assert (
-            "lower(COALESCE(loc->'address'->>'addressLocality', '')) = ANY($1)" in where
-        )
-        assert params == [NCR_CITIES]
+        # Keep a job unless EVERY geocoded location is in the DC locality area:
+        # EXISTS a location whose materialized locality_area differs (NULL counts
+        # as non-NCR via IS DISTINCT FROM), OR the job has no location rows at all.
+        assert "commercial.job_locations lo " in where
+        assert "lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id" in where
+        assert "lo.locality_area IS DISTINCT FROM $1" in where
+        assert "NOT EXISTS (SELECT 1 FROM commercial.job_locations lo2" in where
+        # The single bound param is the shared federal DC locality name.
+        assert params == [NCR_LOCALITY]
 
     def test_exclude_ncr_placeholder_sequential_after_other_filters(self):
         where, params = _build_where(
@@ -212,14 +224,10 @@ class TestBuildWhere:
         assert "$2" in where  # company
         assert "$3" in where  # keyword (title + slug)
         assert "ILIKE $4" in where  # location locality + region
-        assert "= ANY($5)" in where  # NCR city list
-        assert params == [["Secret"], "%X%", "%y%", "%Denver%", NCR_CITIES]
+        assert "IS DISTINCT FROM $5" in where  # NCR locality
+        assert params == [["Secret"], "%X%", "%y%", "%Denver%", NCR_LOCALITY]
         for i in range(1, len(params) + 1):
             assert f"${i}" in where, f"missing placeholder ${i}"
-
-    def test_exclude_ncr_city_list_is_lowercase(self):
-        # The predicate compares lower(locality); the list must already be lowercase.
-        assert NCR_CITIES == [c.lower() for c in NCR_CITIES]
 
     def test_loc_none_leaves_sql_unchanged(self):
         where, params = _build_where()
@@ -251,16 +259,14 @@ class TestBuildWhere:
         assert "$2" in where  # company
         assert "$3" in where  # keyword (title + slug)
         assert "ILIKE $4" in where  # free-text location locality + region
-        assert "lower(COALESCE(loc->'address'->>'addressLocality', '')) = ANY($5)" in (
-            where
-        )  # NCR city list
+        assert "lo.locality_area IS DISTINCT FROM $5" in where  # NCR locality
         assert f"{_LABEL} = ANY($6)" in where  # loc combined-label list
         assert params == [
             ["Secret"],
             "%X%",
             "%y%",
             "%Denver%",
-            NCR_CITIES,
+            NCR_LOCALITY,
             ["Denver, CO"],
         ]
         for i in range(1, len(params) + 1):
@@ -544,16 +550,15 @@ class TestEndpoint:
         assert "ILIKE $1" in sql
         assert conn.fetch.call_args.args[1:] == ("%Denver%",)
 
-    async def test_exclude_ncr_binds_city_list_param(self, client):
+    async def test_exclude_ncr_binds_locality_param(self, client):
         ac, conn = client
         await ac.get("/api/commercial/jobs", params={"exclude_ncr": 1})
         sql = conn.fetch.call_args.args[0]
-        assert "WHERE NOT (" in sql
-        assert "IN ('VA', 'MD')" in sql
-        assert "= ANY($1)" in sql
-        # One param: the city list, bound to both the count and list queries.
-        assert conn.fetchval.call_args.args[1:] == (NCR_CITIES,)
-        assert conn.fetch.call_args.args[1:] == (NCR_CITIES,)
+        assert "lo.locality_area IS DISTINCT FROM $1" in sql
+        assert "NOT EXISTS (SELECT 1 FROM commercial.job_locations lo2" in sql
+        # One param: the DC locality name, bound to both the count and list queries.
+        assert conn.fetchval.call_args.args[1:] == (NCR_LOCALITY,)
+        assert conn.fetch.call_args.args[1:] == (NCR_LOCALITY,)
 
     async def test_exclude_ncr_absent_leaves_no_ncr_clause(self, client):
         ac, conn = client
@@ -803,10 +808,10 @@ class TestMapEndpoint:
         )
         sql = conn.fetch.call_args.args[0]
         assert "data->>'securityClearanceRequirement' = ANY($1)" in sql
-        assert "= ANY($2)" in sql  # NCR city list
+        assert "lo.locality_area IS DISTINCT FROM $2" in sql  # NCR locality
         assert "lo.lon BETWEEN $3 AND $5" in sql
         assert "lo.lat BETWEEN $4 AND $6" in sql
-        assert conn.fetch.call_args.args[1:] == (["Secret"], NCR_CITIES, *BBOX_COORDS)
+        assert conn.fetch.call_args.args[1:] == (["Secret"], NCR_LOCALITY, *BBOX_COORDS)
 
     async def test_point_shape(self, client):
         ac, conn = client

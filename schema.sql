@@ -874,3 +874,88 @@ GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA commercial TO usajobs_colle
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA commercial TO usajobs_collector;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA commercial TO usajobs_web;
+
+
+-- ============================================================
+-- commercial geo + indexes (migrations 09, 10, 11)
+-- Appended snapshot of the post-migration-08 commercial changes: the
+-- active-set index, the GeoNames gazetteer + job_locations table (loaded
+-- by scripts/load_geonames.py and cj_collect.py), and the materialized
+-- OPM locality_area used by exclude_ncr.
+-- ============================================================
+
+-- from migrations/09_commercial_indexes.sql
+CREATE INDEX IF NOT EXISTS idx_commercial_jobs_active_posted
+    ON commercial.jobs_raw ((data->>'datePosted') DESC NULLS LAST, ext_id)
+    WHERE source = 'clearancejobs' AND data IS NOT NULL AND consecutive_misses = 0;
+
+-- from migrations/10_commercial_geo.sql
+-- GeoNames cities15000 gazetteer (every city with population > 15000). Keyed by the
+-- GeoNames id; admin1 is the source admin-1 code (NULL where GeoNames ships none).
+CREATE TABLE IF NOT EXISTS commercial.geo_cities (
+    geonameid   INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    ascii_name  TEXT NOT NULL,
+    lat         DOUBLE PRECISION NOT NULL,
+    lon         DOUBLE PRECISION NOT NULL,
+    country     TEXT NOT NULL,
+    admin1      TEXT,
+    population  INTEGER
+);
+
+-- Case-insensitive city lookup scoped by country + admin1 — the 'city' geocode path.
+CREATE INDEX IF NOT EXISTS idx_commercial_geo_cities_lookup
+    ON commercial.geo_cities (lower(ascii_name), country, admin1);
+
+-- GeoNames US postal gazetteer. Keyed by 5-digit zip; state is the USPS 2-letter code.
+CREATE TABLE IF NOT EXISTS commercial.geo_zips (
+    zip    TEXT PRIMARY KEY,
+    place  TEXT,
+    state  TEXT,
+    lat    DOUBLE PRECISION NOT NULL,
+    lon    DOUBLE PRECISION NOT NULL
+);
+
+-- One row per parsed location on a commercial posting, rewritten per fetch by
+-- cj_collect.py. seq orders multiple locations on one posting; lat/lon are NULL when
+-- geocoding found no match, and geocode_method records the path that hit ('zip'/'city').
+CREATE TABLE IF NOT EXISTS commercial.job_locations (
+    source          TEXT NOT NULL,
+    ext_id          TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    city            TEXT,
+    region          TEXT,
+    country         TEXT,
+    postal          TEXT,
+    lat             DOUBLE PRECISION,
+    lon             DOUBLE PRECISION,
+    geocode_method  TEXT,
+    PRIMARY KEY (source, ext_id, seq),
+    FOREIGN KEY (source, ext_id) REFERENCES commercial.jobs_raw (source, ext_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_job_locations_latlon
+    ON commercial.job_locations (lat, lon);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_job_locations_place
+    ON commercial.job_locations (country, region, city);
+
+-- ============================================================
+-- Grants
+-- ============================================================
+
+GRANT SELECT ON commercial.geo_cities, commercial.geo_zips
+    TO usajobs_collector, usajobs_web;
+
+GRANT SELECT ON commercial.job_locations TO usajobs_web;
+GRANT SELECT, INSERT, UPDATE, DELETE ON commercial.job_locations TO usajobs_collector;
+
+-- from migrations/11_commercial_locality.sql
+ALTER TABLE commercial.job_locations
+    ADD COLUMN IF NOT EXISTS county_fips    TEXT,
+    ADD COLUMN IF NOT EXISTS locality_area  TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_commercial_job_locations_locality
+    ON commercial.job_locations(locality_area);
+
+GRANT SELECT ON public.us_counties, public.locality_areas TO usajobs_collector;
