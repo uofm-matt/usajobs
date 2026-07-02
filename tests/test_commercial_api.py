@@ -15,6 +15,7 @@ from backend.api.commercial import (
     NCR_CITIES,
     _build_where,
     _item,
+    _label_expr,
     _locations,
     _num,
     _sort_exprs,
@@ -26,6 +27,10 @@ BASE = [
     "data IS NOT NULL",
     "consecutive_misses = 0",
 ]
+
+# Combined display label over a job_locations alias, as the loc filter, map query,
+# and locations facet all emit it.
+_LABEL = _label_expr("lo")
 
 
 # --- WHERE builder ---
@@ -215,6 +220,51 @@ class TestBuildWhere:
     def test_exclude_ncr_city_list_is_lowercase(self):
         # The predicate compares lower(locality); the list must already be lowercase.
         assert NCR_CITIES == [c.lower() for c in NCR_CITIES]
+
+    def test_loc_none_leaves_sql_unchanged(self):
+        where, params = _build_where()
+        assert "commercial.job_locations lo" not in where
+        assert params == []
+
+    def test_loc_multi_value_exists_over_job_locations(self):
+        where, params = _build_where(loc=["Denver, CO", "Reston, VA"])
+        # EXISTS over the per-posting geocoded locations, matching the combined
+        # label against the text[] param with = ANY. One bound param (the list).
+        assert "EXISTS (SELECT 1 FROM commercial.job_locations lo" in where
+        assert "lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id" in where
+        assert "lo.city || ', ' || lo.region" in where
+        assert "lo.city || ', ' || lo.country" in where
+        assert "= ANY($1)" in where
+        assert params == [["Denver, CO", "Reston, VA"]]
+
+    def test_loc_placeholder_sequential_after_other_filters(self):
+        # loc numbers last so it never shifts the existing filters' placeholders.
+        where, params = _build_where(
+            clearance=["Secret"],
+            company="X",
+            q="y",
+            location="Denver",
+            exclude_ncr=True,
+            loc=["Denver, CO"],
+        )
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in where  # clearance
+        assert "$2" in where  # company
+        assert "$3" in where  # keyword (title + slug)
+        assert "ILIKE $4" in where  # free-text location locality + region
+        assert "lower(COALESCE(loc->'address'->>'addressLocality', '')) = ANY($5)" in (
+            where
+        )  # NCR city list
+        assert f"{_LABEL} = ANY($6)" in where  # loc combined-label list
+        assert params == [
+            ["Secret"],
+            "%X%",
+            "%y%",
+            "%Denver%",
+            NCR_CITIES,
+            ["Denver, CO"],
+        ]
+        for i in range(1, len(params) + 1):
+            assert f"${i}" in where, f"missing placeholder ${i}"
 
 
 # --- Item shaping ---
@@ -533,9 +583,11 @@ class TestSort:
         ac, conn = client
         await ac.get("/api/commercial/jobs", params={"sort": field, "order": order})
         sql = conn.fetch.call_args.args[0]
-        inner = f"ORDER BY {_sort_exprs('data')[field]} {direction} NULLS LAST, ext_id"
+        exprs = _sort_exprs("data", order)
+        inner = f"ORDER BY {exprs[field]} {direction} NULLS LAST, ext_id"
         outer = (
-            f"ORDER BY {_sort_exprs('j.data')[field]} {direction} NULLS LAST, j.ext_id"
+            f"ORDER BY {_sort_exprs('j.data', order)[field]} {direction}"
+            " NULLS LAST, j.ext_id"
         )
         assert inner in sql
         assert outer in sql
@@ -547,6 +599,21 @@ class TestSort:
         assert "CASE WHEN" in sql
         assert "baseSalary" in sql
         assert "::numeric END DESC" in sql
+
+    async def test_salary_direction_picks_range_bound(self, client):
+        # Highest-first ranks by the range ceiling (max, then min); lowest-first
+        # by the floor (min, then max).
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"sort": "salary"})
+        assert (
+            "COALESCE(data->'baseSalary'->'value'->>'maxValue', data->'baseSalary'->'value'->>'minValue')"
+            in conn.fetch.call_args.args[0]
+        )
+        await ac.get("/api/commercial/jobs", params={"sort": "salary", "order": "asc"})
+        assert (
+            "COALESCE(data->'baseSalary'->'value'->>'minValue', data->'baseSalary'->'value'->>'maxValue')"
+            in conn.fetch.call_args.args[0]
+        )
 
     async def test_nulls_last_in_both_clauses_regardless_of_direction(self, client):
         ac, conn = client
@@ -593,6 +660,7 @@ class TestFiltersEndpoint:
             [{"value": "United States", "c": 40}, {"value": "Germany", "c": 2}],
             [{"value": "Aerospace", "c": 30}, {"value": "IT", "c": 9}],
             [{"value": "Full-time", "c": 50}, {"value": "Contract", "c": 4}],
+            [{"value": "Denver, CO", "c": 15}, {"value": "Reston, VA", "c": 7}],
         ]
         r = await ac.get("/api/commercial/filters")
         assert r.status_code == 200
@@ -613,15 +681,25 @@ class TestFiltersEndpoint:
                 {"value": "Full-time", "count": 50},
                 {"value": "Contract", "count": 4},
             ],
+            "locations": [
+                {"value": "Denver, CO", "count": 15},
+                {"value": "Reston, VA", "count": 7},
+            ],
         }
 
     async def test_sql_targets_active_predicate(self, client):
         ac, conn = client
         await ac.get("/api/commercial/filters")
-        clearance_sql, country_sql, industry_sql, employment_sql = (
+        clearance_sql, country_sql, industry_sql, employment_sql, locations_sql = (
             c.args[0] for c in conn.fetch.call_args_list
         )
-        for sql in (clearance_sql, country_sql, industry_sql, employment_sql):
+        for sql in (
+            clearance_sql,
+            country_sql,
+            industry_sql,
+            employment_sql,
+            locations_sql,
+        ):
             assert ACTIVE in sql
         assert "securityClearanceRequirement" in clearance_sql
         # Country facet normalizes list/single-object jobLocation like the filter.
@@ -630,3 +708,140 @@ class TestFiltersEndpoint:
         assert "ELSE jsonb_build_array(data->'jobLocation') END" in country_sql
         assert "data->>'industry'" in industry_sql
         assert "data->>'employmentType'" in employment_sql
+
+    async def test_locations_facet_sql(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/filters")
+        locations_sql = conn.fetch.call_args_list[4].args[0]
+        # Combined label over geocoded job_locations of active postings.
+        assert "commercial.job_locations lo" in locations_sql
+        assert "lo.city IS NOT NULL" in locations_sql
+        assert "lo.city || ', ' || lo.region" in locations_sql
+        assert "lo.city || ', ' || lo.country" in locations_sql
+        # Per-job count (a posting counted once per label) and count DESC, value.
+        assert "COUNT(DISTINCT ext_id)" in locations_sql
+        assert "ORDER BY c DESC, value" in locations_sql
+
+
+# --- Map endpoint (mocked pool) ---
+
+BBOX = "-109,37,-102,41"
+BBOX_COORDS = (-109.0, 37.0, -102.0, 41.0)
+
+
+def _map_row(**over):
+    row = {
+        "ext_id": "1000001",
+        "url": "https://www.clearancejobs.com/jobs/1000001/systems-engineer",
+        "title": "Systems Engineer",
+        "company": "Acme Defense",
+        "clearance": "Secret",
+        "salary_min": None,
+        "salary_max": None,
+        "label": "Denver, CO",
+        "lat": 39.7392,
+        "lon": -104.9903,
+    }
+    row.update(over)
+    return row
+
+
+class TestMapEndpoint:
+    async def test_requires_bbox(self, client):
+        ac, _ = client
+        r = await ac.get("/api/commercial/map")
+        assert r.status_code == 422  # bbox is a required query param
+
+    async def test_invalid_bbox_rejected(self, client):
+        ac, conn = client
+        r = await ac.get("/api/commercial/map", params={"bbox": "not,a,bbox,x"})
+        assert r.status_code == 422
+        conn.fetch.assert_not_called()
+
+    async def test_empty_featurecollection(self, client):
+        ac, conn = client
+        conn.fetch.return_value = []
+        r = await ac.get("/api/commercial/map", params={"bbox": BBOX, "zoom": 6})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["type"] == "FeatureCollection"
+        assert body["metadata"] == {"total": 0, "clustered": False, "zoom": 6}
+        assert body["features"] == []
+
+    async def test_bbox_and_active_sql(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/map", params={"bbox": BBOX, "zoom": 6})
+        sql = conn.fetch.call_args.args[0]
+        assert "FROM commercial.jobs_raw" in sql
+        assert "JOIN commercial.job_locations lo" in sql
+        assert "ON lo.source = m.source AND lo.ext_id = m.ext_id" in sql
+        assert ACTIVE in sql
+        assert "lo.lat IS NOT NULL AND lo.lon IS NOT NULL" in sql
+        # No content filters -> bbox binds $1..$4 (lon between W/E, lat between S/N).
+        assert "lo.lon BETWEEN $1 AND $3" in sql
+        assert "lo.lat BETWEEN $2 AND $4" in sql
+        assert conn.fetch.call_args.args[1:] == BBOX_COORDS
+
+    async def test_filter_params_shift_bbox_placeholders(self, client):
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/map",
+            params={"bbox": BBOX, "zoom": 6, "loc": ["Denver, CO"]},
+        )
+        sql = conn.fetch.call_args.args[0]
+        # loc binds $1; bbox continues at $2..$5, coherent with the content filter.
+        assert f"{_LABEL} = ANY($1)" in sql
+        assert "lo.lon BETWEEN $2 AND $4" in sql
+        assert "lo.lat BETWEEN $3 AND $5" in sql
+        assert conn.fetch.call_args.args[1:] == (["Denver, CO"], *BBOX_COORDS)
+
+    async def test_facet_and_bbox_combine(self, client):
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/map",
+            params={"bbox": BBOX, "clearance": ["Secret"], "exclude_ncr": 1},
+        )
+        sql = conn.fetch.call_args.args[0]
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in sql
+        assert "= ANY($2)" in sql  # NCR city list
+        assert "lo.lon BETWEEN $3 AND $5" in sql
+        assert "lo.lat BETWEEN $4 AND $6" in sql
+        assert conn.fetch.call_args.args[1:] == (["Secret"], NCR_CITIES, *BBOX_COORDS)
+
+    async def test_point_shape(self, client):
+        ac, conn = client
+        conn.fetch.return_value = [_map_row(salary_min="90000", salary_max="120000")]
+        r = await ac.get("/api/commercial/map", params={"bbox": BBOX, "zoom": 6})
+        body = r.json()
+        assert body["metadata"]["total"] == 1
+        feat = body["features"][0]
+        assert feat["type"] == "Feature"
+        assert feat["geometry"] == {
+            "type": "Point",
+            "coordinates": [-104.9903, 39.7392],
+        }
+        assert feat["properties"] == {
+            "ext_id": "1000001",
+            "url": "https://www.clearancejobs.com/jobs/1000001/systems-engineer",
+            "title": "Systems Engineer",
+            "company": "Acme Defense",
+            "clearance": "Secret",
+            "salary_min": 90000,
+            "salary_max": 120000,
+            "location": "Denver, CO",
+        }
+
+    async def test_no_user_values_in_map_sql(self, client):
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/map",
+            params={
+                "bbox": BBOX,
+                "company": "Acme Defense",
+                "q": "engineer",
+                "loc": "Denver, CO",
+            },
+        )
+        sql = conn.fetch.call_args.args[0]
+        for literal in ("Acme Defense", "engineer", "Denver, CO"):
+            assert literal not in sql

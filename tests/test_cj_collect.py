@@ -173,7 +173,7 @@ class TestApplyData:
     def test_new_data_updates_no_history(self):
         cur = MagicMock()
         stats = Counter()
-        cat = cj_collect._apply_data(cur, "42", "new", None, 7, stats)
+        cat = cj_collect._apply_data(cur, "42", "new", None, 7, {}, stats)
         assert cat == "fetched"
         assert stats["fetched"] == 1
         sqls = [c.args[0] for c in cur.execute.call_args_list]
@@ -183,21 +183,29 @@ class TestApplyData:
     def test_changed_archives_then_updates(self):
         cur = MagicMock()
         stats = Counter()
-        cat = cj_collect._apply_data(cur, "42", "new", "old", 7, stats)
+        cat = cj_collect._apply_data(cur, "42", "new", "old", 7, {}, stats)
         assert cat == "changed"
         assert stats["changed"] == 1
-        first, second = cur.execute.call_args_list
-        assert "INSERT INTO commercial.jobs_history" in first.args[0]
-        assert "captured_at" in first.args[0] and "last_seen" in first.args[0]
-        assert "UPDATE commercial.jobs_raw SET data" in second.args[0]
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        hist = next(i for i, s in enumerate(sqls) if "jobs_history" in s)
+        upd = next(i for i, s in enumerate(sqls) if "jobs_raw SET data" in s)
+        assert hist < upd  # archive precedes the update
+        assert "captured_at" in sqls[hist] and "last_seen" in sqls[hist]
 
     def test_unchanged_touches_row_no_history(self):
         cur = MagicMock()
         stats = Counter()
-        cat = cj_collect._apply_data(cur, "42", "same", "same", None, stats)
+        cat = cj_collect._apply_data(cur, "42", "same", "same", None, {}, stats)
         assert cat == "unchanged"
         sqls = [c.args[0] for c in cur.execute.call_args_list]
         assert not any("jobs_history" in s for s in sqls)
+
+    def test_success_path_rewrites_job_locations(self):
+        # A posting with no jobLocation still fires the delete-then-nothing rewrite.
+        cur = MagicMock()
+        cj_collect._apply_data(cur, "42", "new", None, 7, {}, Counter())
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        assert any("DELETE FROM commercial.job_locations" in s for s in sqls)
 
 
 class TestFetchDetail:
@@ -285,6 +293,32 @@ class TestFetchDetail:
         with patch("cj_collect.requests.get", return_value=self._resp()):
             cj_collect.fetch_detail(cur, "9990001", "u", {}, ["United States"], stats)
         assert stats["fetched"] == 1
+
+    def test_success_writes_job_locations(self):
+        # fetchone returns None for the pre-parse SELECT and for every geocode probe,
+        # so the fixture's Washington DC location is written unmatched (lat/lon NULL).
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        stats = Counter()
+        with patch("cj_collect.requests.get", return_value=self._resp()):
+            cj_collect.fetch_detail(cur, "9990001", "u", {}, None, stats)
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        assert any("DELETE FROM commercial.job_locations" in s for s in sqls)
+        ins = next(
+            c
+            for c in cur.execute.call_args_list
+            if "INSERT INTO commercial.job_locations" in c.args[0]
+        )
+        # seq 0, city Washington, region DC, country United States, postal 20001.
+        assert ins.args[1][:7] == (
+            "clearancejobs",
+            "9990001",
+            0,
+            "Washington",
+            "DC",
+            "United States",
+            "20001",
+        )
 
 
 class TestRefreshCandidates:
@@ -496,6 +530,295 @@ class TestHarvestRoster:
         )
         conn.commit.assert_called_once()
         assert "2 company slugs" in capsys.readouterr().out
+
+
+def _place(**address):
+    return {"@type": "Place", "address": {"@type": "PostalAddress", **address}}
+
+
+class TestNormalizeLocation:
+    def test_state_name_mapped_to_usps(self):
+        loc = cj_collect._normalize_location(
+            _place(
+                addressLocality="Reston",
+                addressRegion="Virginia",
+                addressCountry="United States",
+            )
+        )
+        assert loc == {
+            "city": "Reston",
+            "region": "VA",
+            "country": "United States",
+            "postal": None,
+        }
+
+    def test_two_letter_region_uppercased(self):
+        loc = cj_collect._normalize_location(
+            _place(addressRegion="va", addressCountry="usa")
+        )
+        assert loc["region"] == "VA" and loc["country"] == "United States"
+
+    @pytest.mark.parametrize(
+        "region", ["Washington DC", "District of Columbia", "Washington D.C.", "dc"]
+    )
+    def test_dc_variants_map_to_dc(self, region):
+        loc = cj_collect._normalize_location(
+            _place(addressRegion=region, addressCountry="US")
+        )
+        assert loc["region"] == "DC"
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["USA", "us", "U.S.", "u.s.a.", "United States of America", "united states"],
+    )
+    def test_country_aliases_fold_to_united_states(self, raw):
+        loc = cj_collect._normalize_location(_place(addressCountry=raw))
+        assert loc["country"] == "United States"
+
+    def test_non_us_country_title_cased_region_kept(self):
+        loc = cj_collect._normalize_location(
+            _place(
+                addressLocality="stuttgart",
+                addressRegion="Baden-Wurttemberg",
+                addressCountry="germany",
+            )
+        )
+        assert loc["country"] == "Germany"
+        assert loc["region"] == "Baden-Wurttemberg"  # non-US region kept as-is
+        assert loc["city"] == "Stuttgart"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("Ft. Belvoir", "Fort Belvoir"),
+            ("Ft Meade", "Fort Meade"),
+            ("St. Louis", "Saint Louis"),
+            ("St Petersburg", "Saint Petersburg"),
+            ("Sterling", "Sterling"),  # 'St' prefix must not fire mid-word
+        ],
+    )
+    def test_ft_st_prefix_expansion(self, raw, expected):
+        loc = cj_collect._normalize_location(_place(addressLocality=raw))
+        assert loc["city"] == expected
+
+    def test_acronym_tokens_preserved(self):
+        loc = cj_collect._normalize_location(_place(addressLocality="andrews AFB"))
+        assert loc["city"] == "Andrews AFB"
+        loc = cj_collect._normalize_location(_place(addressLocality="Washington JBAB"))
+        assert loc["city"] == "Washington JBAB"
+
+    def test_all_caps_string_is_titled_not_acronymed(self):
+        loc = cj_collect._normalize_location(_place(addressLocality="FORT MEADE"))
+        assert loc["city"] == "Fort Meade"
+
+    def test_whitespace_collapsed_and_titled(self):
+        loc = cj_collect._normalize_location(
+            _place(addressLocality="  colorado   springs  ")
+        )
+        assert loc["city"] == "Colorado Springs"
+
+    def test_postal_kept_as_is(self):
+        loc = cj_collect._normalize_location(_place(postalCode=" 20001-1234 "))
+        assert loc["postal"] == "20001-1234"
+
+    def test_no_address_returns_none(self):
+        assert cj_collect._normalize_location({"@type": "Place"}) is None
+
+    def test_empty_address_returns_none(self):
+        assert (
+            cj_collect._normalize_location(
+                _place(addressLocality="", addressCountry="   ")
+            )
+            is None
+        )
+
+    def test_country_only_is_usable(self):
+        loc = cj_collect._normalize_location(_place(addressCountry="Japan"))
+        assert loc == {
+            "city": None,
+            "region": None,
+            "country": "Japan",
+            "postal": None,
+        }
+
+
+class TestGeocode:
+    def test_us_zip_hit(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = (38.9, -77.0)
+        out = cj_collect._geocode(
+            cur,
+            {
+                "city": "Washington",
+                "region": "DC",
+                "country": "United States",
+                "postal": "20001-1234",
+            },
+        )
+        assert out == (38.9, -77.0, "zip")
+        sql, params = cur.execute.call_args.args
+        assert "geo_zips" in sql and params == ("20001",)  # zip5 = first 5 digits
+
+    def test_us_falls_back_to_city_when_zip_misses(self):
+        cur = MagicMock()
+        cur.fetchone.side_effect = [None, (37.3, -122.0)]  # zip miss, city hit
+        out = cj_collect._geocode(
+            cur,
+            {
+                "city": "Reston",
+                "region": "VA",
+                "country": "United States",
+                "postal": "99999",
+            },
+        )
+        assert out == (37.3, -122.0, "city")
+        city_sql, city_params = cur.execute.call_args.args
+        assert "geo_cities" in city_sql and "country = 'US'" in city_sql
+        assert city_params == ("Reston", "VA")
+
+    def test_us_no_match_returns_nulls(self):
+        cur = MagicMock()
+        cur.fetchone.side_effect = [None, None]
+        out = cj_collect._geocode(
+            cur,
+            {
+                "city": "Nowhere",
+                "region": "ZZ",
+                "country": "United States",
+                "postal": "00000",
+            },
+        )
+        assert out == (None, None, None)
+
+    def test_non_us_city_by_iso2(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = (48.8, 9.2)
+        out = cj_collect._geocode(
+            cur,
+            {"city": "Stuttgart", "region": None, "country": "Germany", "postal": None},
+        )
+        assert out == (48.8, 9.2, "city")
+        sql, params = cur.execute.call_args.args
+        assert params == ("Stuttgart", "DE")
+
+    def test_unknown_country_skips_query(self):
+        cur = MagicMock()
+        out = cj_collect._geocode(
+            cur,
+            {"city": "Timbuktu", "region": None, "country": "Narnia", "postal": None},
+        )
+        assert out == (None, None, None)
+        cur.execute.assert_not_called()
+
+
+class TestWriteJobLocations:
+    def test_delete_then_insert_with_seq(self):
+        cur = MagicMock()
+        posting = {
+            "jobLocation": [
+                _place(
+                    addressLocality="Reston",
+                    addressRegion="VA",
+                    addressCountry="United States",
+                    postalCode="20190",
+                ),
+                _place(addressLocality="stuttgart", addressCountry="Germany"),
+            ]
+        }
+        with patch(
+            "cj_collect._geocode",
+            side_effect=[(1.0, 2.0, "zip"), (3.0, 4.0, "city")],
+        ):
+            methods = cj_collect._write_job_locations(cur, "42", posting)
+        assert methods == ["zip", "city"]
+        calls = cur.execute.call_args_list
+        assert "DELETE FROM commercial.job_locations" in calls[0].args[0]
+        assert calls[0].args[1] == ("clearancejobs", "42")
+        ins0, ins1 = calls[1], calls[2]
+        assert ins0.args[1] == (
+            "clearancejobs",
+            "42",
+            0,
+            "Reston",
+            "VA",
+            "United States",
+            "20190",
+            1.0,
+            2.0,
+            "zip",
+        )
+        assert ins1.args[1] == (
+            "clearancejobs",
+            "42",
+            1,
+            "Stuttgart",
+            None,
+            "Germany",
+            None,
+            3.0,
+            4.0,
+            "city",
+        )
+
+    def test_single_dict_location_handled(self):
+        cur = MagicMock()
+        posting = {
+            "jobLocation": _place(
+                addressLocality="Reston", addressCountry="United States"
+            )
+        }
+        with patch("cj_collect._geocode", return_value=(None, None, None)):
+            methods = cj_collect._write_job_locations(cur, "9", posting)
+        assert methods == [None]
+
+    def test_unusable_locations_skipped_delete_still_runs(self):
+        cur = MagicMock()
+        posting = {"jobLocation": [{"@type": "Place"}]}  # no address
+        methods = cj_collect._write_job_locations(cur, "9", posting)
+        assert methods == []
+        calls = cur.execute.call_args_list
+        assert len(calls) == 1 and "DELETE" in calls[0].args[0]
+
+    def test_no_joblocation_key_deletes_only(self):
+        cur = MagicMock()
+        assert cj_collect._write_job_locations(cur, "9", {}) == []
+        assert cur.execute.call_count == 1
+
+
+class TestRegeocode:
+    def test_summary_counts_by_method(self, capsys):
+        conn, cur = _cursor_conn()
+        cur.fetchall.return_value = [
+            (
+                "1",
+                {
+                    "jobLocation": _place(
+                        addressLocality="Reston", addressCountry="United States"
+                    )
+                },
+            ),
+            ("2", {"jobLocation": _place(addressCountry="Japan")}),  # country-only row
+        ]
+        with (
+            patch("cj_collect.psycopg2.connect", return_value=conn),
+            patch(
+                "cj_collect._geocode",
+                side_effect=[(1.0, 2.0, "zip"), (None, None, None)],
+            ),
+        ):
+            cj_collect.regeocode()
+        out = capsys.readouterr().out
+        assert "'rows': 2" in out
+        assert "'locations': 2" in out
+        assert "'zip': 1" in out and "'unmatched': 1" in out
+        conn.commit.assert_called_once()
+        # Both rows had their locations rebuilt (delete per row).
+        deletes = [
+            c
+            for c in cur.execute.call_args_list
+            if "DELETE FROM commercial.job_locations" in c.args[0]
+        ]
+        assert len(deletes) == 2
 
 
 class TestDbConfig:

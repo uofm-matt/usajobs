@@ -36,6 +36,7 @@ const CJ_FACETS = [
     { key: 'country', param: 'country', field: 'countries' },
     { key: 'industry', param: 'industry', field: 'industries' },
     { key: 'employment_type', param: 'employment_type', field: 'employment_types' },
+    { key: 'loc', param: 'loc', field: 'locations' },
 ];
 const cjFacetBodies = Object.fromEntries(
     CJ_FACETS.map((f) => [f.key, document.getElementById(`cj-facet-${f.key}`)]),
@@ -63,11 +64,10 @@ let cjFilterTimer = null;
 let commercialFiltersLoaded = false;
 let federalSortValue = sortField.value;
 
-// Toggle between views
+// Toggle between views. Commercial is a full map citizen now: the source toggle
+// keeps app.js's layer in sync (see setSource), so this is a plain display toggle
+// and the federal map is untouched — pixel-identical to before.
 mapBtn.addEventListener('click', () => {
-    // The filter panel is shared with the map view; if Commercial swapped in its
-    // own controls, reset to federal through setSource before revealing the map.
-    if (source === 'commercial') setSource('federal');
     active = false;
     mapEl.style.display = '';
     listPanel.style.display = 'none';
@@ -112,6 +112,23 @@ function setSource(next) {
     }
     currentPage = 1;
     loadList();
+    // Keep app.js's map layer in step with the source — even in list view, so the
+    // right markers are ready when the map is shown (and the source is never stale).
+    reloadMap();
+}
+
+// Tell app.js (separate module, owns the Leaflet layer) to reload the map layer
+// for the current source. The source rides along so app.js needn't track it.
+function reloadMap() {
+    window.dispatchEvent(new CustomEvent('maplayer-reload', { detail: source }));
+}
+
+// A commercial filter changed: reload the list when it's the active view, else
+// the map layer. (The commercial sidebar shows in both views.)
+function commercialChanged() {
+    currentPage = 1;
+    if (active) loadList();
+    else reloadMap();
 }
 
 // Facet options for the commercial sidebar — fetched once per session, since the
@@ -140,10 +157,7 @@ function buildFacetGroup(facet, options) {
         cb.type = 'checkbox';
         cb.value = opt.value;
         cb.checked = true;
-        cb.addEventListener('change', () => {
-            currentPage = 1;
-            loadList();
-        });
+        cb.addEventListener('change', commercialChanged);
         const text = document.createElement('span');
         text.textContent = `${opt.value} (${opt.count.toLocaleString()})`;
         label.append(cb, text);
@@ -157,8 +171,7 @@ function facetBoxes(key) {
 
 function setFacetGroup(key, checked) {
     for (const cb of facetBoxes(key)) cb.checked = checked;
-    currentPage = 1;
-    loadList();
+    commercialChanged();
 }
 
 // "all | none" links per group live in the static HTML headers.
@@ -174,24 +187,15 @@ for (const group of document.querySelectorAll('.cj-facet-group')) {
 
 commercialSearch.addEventListener('input', () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-        currentPage = 1;
-        loadList();
-    }, SEARCH_DEBOUNCE_MS);
+    searchTimer = setTimeout(commercialChanged, SEARCH_DEBOUNCE_MS);
 });
 
-cjExcludeNcr.addEventListener('change', () => {
-    currentPage = 1;
-    loadList();
-});
+cjExcludeNcr.addEventListener('change', commercialChanged);
 
 for (const input of [cjCompany, cjLocation, cjSalaryMin]) {
     input.addEventListener('input', () => {
         clearTimeout(cjFilterTimer);
-        cjFilterTimer = setTimeout(() => {
-            currentPage = 1;
-            loadList();
-        }, SEARCH_DEBOUNCE_MS);
+        cjFilterTimer = setTimeout(commercialChanged, SEARCH_DEBOUNCE_MS);
     });
 }
 
@@ -204,8 +208,7 @@ cjClearBtn.addEventListener('click', () => {
     for (const facet of CJ_FACETS) {
         for (const cb of facetBoxes(facet.key)) cb.checked = true;
     }
-    currentPage = 1;
-    loadList();
+    commercialChanged();
 });
 
 sortField.addEventListener('change', () => {
@@ -256,13 +259,13 @@ async function loadList() {
     }
 }
 
-async function loadCommercial() {
-    const params = new URLSearchParams({
-        limit: COMMERCIAL_PER_PAGE,
-        offset: (currentPage - 1) * COMMERCIAL_PER_PAGE,
-        sort: sortField.value,
-        order: sortOrder,
-    });
+// Append the active commercial filter values (search box, company, location,
+// salary floor, NCR toggle, and each facet group's selection) onto `params`.
+// Per group: all checked (or not yet loaded) omits the param; a subset appends one
+// repeated param per checked value; none checked returns false so the caller can
+// render the empty state (list) or clear the markers (map) — an omitted param
+// would wrongly read as "all".
+function appendCommercialFilters(params) {
     const keyword = commercialSearch.value.trim();
     if (keyword) params.set('q', keyword);
     if (cjCompany.value.trim()) params.set('company', cjCompany.value.trim());
@@ -270,19 +273,35 @@ async function loadCommercial() {
     if (cjSalaryMin.value) params.set('salary_min', cjSalaryMin.value);
     if (cjExcludeNcr.checked) params.set('exclude_ncr', '1');
 
-    // Per group: all checked (or not yet loaded) omits the param; a subset appends
-    // one repeated param per checked value; none checked means "show nothing" —
-    // an omitted param would wrongly read as "all", so render the empty state.
     for (const facet of CJ_FACETS) {
         const boxes = facetBoxes(facet.key);
         if (!boxes.length) continue;
         const checked = boxes.filter((b) => b.checked);
         if (checked.length === boxes.length) continue;
-        if (!checked.length) {
-            renderCommercial({ total: 0, jobs: [] });
-            return;
-        }
+        if (!checked.length) return false;
         for (const b of checked) params.append(facet.param, b.value);
+    }
+    return true;
+}
+
+// Bridge for app.js (separate module): the /api/commercial/map filter query for
+// the current sidebar state, or null when a facet group is fully unchecked (app.js
+// clears the markers rather than querying).
+window.commercialMapQuery = () => {
+    const params = new URLSearchParams();
+    return appendCommercialFilters(params) ? params.toString() : null;
+};
+
+async function loadCommercial() {
+    const params = new URLSearchParams({
+        limit: COMMERCIAL_PER_PAGE,
+        offset: (currentPage - 1) * COMMERCIAL_PER_PAGE,
+        sort: sortField.value,
+        order: sortOrder,
+    });
+    if (!appendCommercialFilters(params)) {
+        renderCommercial({ total: 0, jobs: [] });
+        return;
     }
 
     listBody.innerHTML = '<div class="list-loading">Loading...</div>';

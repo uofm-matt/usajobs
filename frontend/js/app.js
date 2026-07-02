@@ -9,6 +9,7 @@ import { initFilters, getFilterParams } from './filters.js';
 let map;
 let jobLayer;
 let debounceTimer;
+let currentSource = 'federal';
 const DEBOUNCE_MS = 300;
 
 // DOM elements
@@ -68,12 +69,20 @@ async function initMap() {
     // Load jobs on viewport change
     map.on('moveend', () => {
         clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(loadJobs, DEBOUNCE_MS);
+        debounceTimer = setTimeout(loadMapLayer, DEBOUNCE_MS);
+    });
+
+    // Commercial mode is a full map citizen: list.js signals a layer reload
+    // (source switch, entering map view, or a commercial filter change) and
+    // carries the current source so this module needn't track it.
+    window.addEventListener('maplayer-reload', (e) => {
+        currentSource = e.detail;
+        renderCurrentLayer();
     });
 
     // Initialize filter panel — reload jobs when filters change
     await initFilters({
-        onFilter: () => loadJobs(true),
+        onFilter: () => loadMapLayer(true),
         onZoom: ([south, west, north, east]) => {
             map.fitBounds([[south, west], [north, east]], { padding: [20, 20] });
         },
@@ -83,26 +92,28 @@ async function initMap() {
     });
 
     // Initial load
-    loadJobs();
+    loadMapLayer();
 }
 
-/** Fetch jobs for current viewport and render on map */
-async function loadJobs(fromFilter = false) {
-    if (fromFilter) {
-        window.dispatchEvent(new Event('filters-changed'));
-    }
-    const bounds = map.getBounds();
-    const bbox = [
-        bounds.getWest().toFixed(6),
-        bounds.getSouth().toFixed(6),
-        bounds.getEast().toFixed(6),
-        bounds.getNorth().toFixed(6),
+/** Current map viewport as a "west,south,east,north" bbox string */
+function currentBbox() {
+    const b = map.getBounds();
+    return [
+        b.getWest().toFixed(6),
+        b.getSouth().toFixed(6),
+        b.getEast().toFixed(6),
+        b.getNorth().toFixed(6),
     ].join(',');
+}
+
+/** Fetch + render the layer for the active source at the current viewport */
+async function renderCurrentLayer() {
+    const bbox = currentBbox();
     const zoom = map.getZoom();
 
-    // Keep the list view scoped to the current map viewport
-    if (!fromFilter) {
-        window.dispatchEvent(new CustomEvent('map-moved', { detail: bbox }));
+    if (currentSource === 'commercial') {
+        await loadCommercialLayer(bbox, zoom);
+        return;
     }
 
     const filterParams = getFilterParams();
@@ -116,6 +127,42 @@ async function loadJobs(fromFilter = false) {
         renderJobs(geojson);
     } catch (err) {
         if (err.name === 'AbortError') return; // Cancelled — superseding call owns the spinner
+        showToast(`Failed to load jobs: ${err.message}`);
+    }
+    setLoading(false);
+}
+
+/** Load the map layer, keeping the list view and filter counts in sync */
+async function loadMapLayer(fromFilter = false) {
+    if (fromFilter) {
+        window.dispatchEvent(new Event('filters-changed'));
+    } else {
+        // Keep the list view scoped to the current map viewport
+        window.dispatchEvent(new CustomEvent('map-moved', { detail: currentBbox() }));
+    }
+    await renderCurrentLayer();
+}
+
+/** Fetch and render commercial (ClearanceJobs) markers for the viewport */
+async function loadCommercialLayer(bbox, zoom) {
+    // list.js owns the commercial sidebar state; it returns the filter query, or
+    // null when a facet group is fully unchecked (render no markers).
+    const query = window.commercialMapQuery ? window.commercialMapQuery() : '';
+    if (query === null) {
+        jobLayer.clearLayers();
+        jobCountEl.textContent = `${pluralJobs(0)} in view`;
+        return;
+    }
+
+    let url = `/api/commercial/map?bbox=${bbox}&zoom=${zoom}`;
+    if (query) url += `&${query}`;
+
+    setLoading(true);
+    try {
+        const geojson = await fetchJSON(url, { key: 'jobs' });
+        renderCommercialMarkers(geojson);
+    } catch (err) {
+        if (err.name === 'AbortError') return;
         showToast(`Failed to load jobs: ${err.message}`);
     }
     setLoading(false);
@@ -189,6 +236,54 @@ function renderPoint(lat, lon, p) {
     marker.on('click', () => openDetail(p.id));
 
     marker.addTo(jobLayer);
+}
+
+/** Render commercial point features (raw points — no server-side clustering) */
+function renderCommercialMarkers(geojson) {
+    jobLayer.clearLayers();
+
+    const meta = geojson.metadata || {};
+    const total = meta.total ?? geojson.features.length;
+
+    jobCountEl.textContent = `${pluralJobs(total)} in view`;
+
+    for (const feature of geojson.features) {
+        const [lon, lat] = feature.geometry.coordinates;
+        renderCommercialPoint(lat, lon, feature.properties);
+    }
+}
+
+/** Render one commercial job point — hover shows detail, click opens the posting */
+function renderCommercialPoint(lat, lon, p) {
+    const marker = L.circleMarker([lat, lon], {
+        radius: 5,
+        fillColor: '#1565c0',
+        fillOpacity: 0.7,
+        color: '#0d47a1',
+        weight: 1,
+    });
+
+    const lines = [`<strong>${escapeHTML(p.title)}</strong>`];
+    if (p.company) lines.push(escapeHTML(p.company));
+    const facts = [];
+    if (p.clearance) facts.push(escapeHTML(p.clearance));
+    const salary = fmtSalary(p.salary_min, p.salary_max);
+    if (salary) facts.push(salary);
+    if (facts.length) lines.push(facts.join(' · '));
+    if (p.location) lines.push(escapeHTML(p.location));
+
+    marker.bindTooltip(lines.join('<br>'), { direction: 'top', offset: [0, -6] });
+    marker.on('click', () => window.open(p.url, '_blank', 'noopener'));
+
+    marker.addTo(jobLayer);
+}
+
+/** Format a bare-integer salary range (commercial payload) */
+function fmtSalary(min, max) {
+    const f = (n) => `$${Number(n).toLocaleString()}`;
+    if (min && max) return `${f(min)}–${f(max)}`;
+    if (min || max) return f(min || max);
+    return '';
 }
 
 /** Dynamically load an external script */

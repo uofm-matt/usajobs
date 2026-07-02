@@ -74,6 +74,105 @@ LOC_RE = re.compile(r"<loc>(.*?)</loc>", re.DOTALL)
 JOB_URL_RE = re.compile(r"/jobs/(\d+)/([^/?#]+)")
 COMPANY_URL_RE = re.compile(r"/jobs/([^/]+)$")
 
+# --- Location normalization + geocoding (writes commercial.job_locations) ---
+
+# Full US state / territory names (and DC variants) -> USPS 2-letter code.
+US_STATE_TO_USPS = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+    "district of columbia": "DC",
+    "washington dc": "DC",
+    "washington d.c.": "DC",
+    "puerto rico": "PR",
+    "guam": "GU",
+    "virgin islands": "VI",
+    "american samoa": "AS",
+    "northern mariana islands": "MP",
+}
+
+# Lowercase-trimmed country spellings that all mean the United States.
+COUNTRY_ALIASES = {
+    "united states",
+    "usa",
+    "us",
+    "u.s.",
+    "u.s.a.",
+    "united states of america",
+}
+
+# Normalized (lowercased) country name -> ISO-2, for the non-US city geocode path.
+COUNTRY_TO_ISO2 = {
+    "united states": "US",
+    "germany": "DE",
+    "japan": "JP",
+    "south korea": "KR",
+    "korea": "KR",
+    "italy": "IT",
+    "united kingdom": "GB",
+    "uk": "GB",
+    "belgium": "BE",
+    "spain": "ES",
+    "australia": "AU",
+    "bahrain": "BH",
+    "kuwait": "KW",
+    "qatar": "QA",
+    "united arab emirates": "AE",
+    "djibouti": "DJ",
+    "poland": "PL",
+    "romania": "RO",
+}
+
+CITY_FT_RE = re.compile(r"^ft\.?\s+", re.IGNORECASE)
+CITY_ST_RE = re.compile(r"^st\.?\s+", re.IGNORECASE)
+
 
 def _db_config(url_env: str = "DATABASE_URL_COLLECTOR") -> dict:
     """Parse a DATABASE_URL into psycopg2 connection kwargs."""
@@ -252,15 +351,160 @@ def _archive_history(cur, ext_id: str) -> None:
     )
 
 
+def _norm_country(raw: str | None) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    val = " ".join(raw.split())
+    if not val:
+        return None
+    if val.lower() in COUNTRY_ALIASES:
+        return "United States"
+    return val.title()
+
+
+def _norm_region(raw: str | None, country: str | None) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    val = " ".join(raw.split())
+    if not val:
+        return None
+    if country != "United States":
+        return val
+    if code := US_STATE_TO_USPS.get(val.lower()):
+        return code
+    if len(val) == 2 and val.isalpha():
+        return val.upper()
+    return val
+
+
+def _norm_city(raw: str | None) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    val = " ".join(raw.split())
+    if not val:
+        return None
+    val = CITY_FT_RE.sub("Fort ", val)
+    val = CITY_ST_RE.sub("Saint ", val)
+    # Short all-caps tokens embedded in mixed-case text are acronyms (AFB, JBAB, NSA)
+    # and keep their case; a wholly-uppercase string is just shouting, so title it.
+    all_caps = val.isupper()
+    return " ".join(
+        tok
+        if not all_caps and tok.isalpha() and tok.isupper() and len(tok) <= 4
+        else tok.title()
+        for tok in val.split(" ")
+    )
+
+
+def _norm_postal(raw) -> str | None:
+    if raw is None:
+        return None
+    val = str(raw).strip()
+    return val or None
+
+
+def _normalize_location(place: dict) -> dict | None:
+    """Normalize one raw jobLocation Place to {city, region, country, postal};
+    None when the Place carries no usable address at all."""
+    if not isinstance(place, dict):
+        return None
+    address = place.get("address")
+    if not isinstance(address, dict):
+        return None
+    country = _norm_country(address.get("addressCountry"))
+    loc = {
+        "city": _norm_city(address.get("addressLocality")),
+        "region": _norm_region(address.get("addressRegion"), country),
+        "country": country,
+        "postal": _norm_postal(address.get("postalCode")),
+    }
+    return loc if any(loc.values()) else None
+
+
+def _geocode(cur, loc: dict) -> tuple[float | None, float | None, str | None]:
+    """Resolve a normalized location to (lat, lon, method): US zip, then US city,
+    then non-US city by ISO-2; (None, None, None) when nothing matches."""
+    city = loc["city"]
+    region = loc["region"]
+    country = loc["country"]
+    postal = loc["postal"]
+    if country == "United States":
+        if postal and (zip5 := "".join(c for c in postal if c.isdigit())[:5]):
+            cur.execute(
+                "SELECT lat, lon FROM commercial.geo_zips WHERE zip = %s", (zip5,)
+            )
+            if row := cur.fetchone():
+                return row[0], row[1], "zip"
+        if city:
+            cur.execute(
+                "SELECT lat, lon FROM commercial.geo_cities "
+                "WHERE country = 'US' AND lower(ascii_name) = lower(%s) "
+                "AND admin1 = %s",
+                (city, region),
+            )
+            if row := cur.fetchone():
+                return row[0], row[1], "city"
+        return None, None, None
+
+    iso2 = COUNTRY_TO_ISO2.get(country.lower()) if country else None
+    if iso2 and city:
+        cur.execute(
+            "SELECT lat, lon FROM commercial.geo_cities "
+            "WHERE lower(ascii_name) = lower(%s) AND country = %s",
+            (city, iso2),
+        )
+        if row := cur.fetchone():
+            return row[0], row[1], "city"
+    return None, None, None
+
+
+def _write_job_locations(cur, ext_id: str, posting: dict) -> list[str | None]:
+    """Rebuild commercial.job_locations for one posting: delete the prior rows, then
+    insert one geocoded row per normalized jobLocation. Returns the per-row methods."""
+    raw = posting.get("jobLocation")
+    if isinstance(raw, dict):
+        raw = [raw]
+    locations = [loc for place in (raw or []) if (loc := _normalize_location(place))]
+
+    cur.execute(
+        "DELETE FROM commercial.job_locations WHERE source = %s AND ext_id = %s",
+        (SOURCE, ext_id),
+    )
+    methods: list[str | None] = []
+    for seq, loc in enumerate(locations):
+        lat, lon, method = _geocode(cur, loc)
+        cur.execute(
+            "INSERT INTO commercial.job_locations "
+            "(source, ext_id, seq, city, region, country, postal, lat, lon, "
+            "geocode_method) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                SOURCE,
+                ext_id,
+                seq,
+                loc["city"],
+                loc["region"],
+                loc["country"],
+                loc["postal"],
+                lat,
+                lon,
+                method,
+            ),
+        )
+        methods.append(method)
+    return methods
+
+
 def _apply_data(
     cur,
     ext_id: str,
     new_data: str,
     old_data: str | None,
     company_id: int | None,
+    posting: dict,
     stats: Counter[str],
 ) -> str:
-    """Write freshly-parsed detail, archiving the prior version when it changed."""
+    """Write freshly-parsed detail, archiving the prior version when it changed, and
+    refresh the posting's geocoded locations."""
     if old_data is None:
         category = "fetched"
     elif old_data != new_data:
@@ -274,6 +518,7 @@ def _apply_data(
         "fetched_at = now(), last_seen = now() WHERE source = %s AND ext_id = %s",
         (new_data, company_id, SOURCE, ext_id),
     )
+    _write_job_locations(cur, ext_id, posting)
     stats[category] += 1
     return category
 
@@ -324,7 +569,7 @@ def fetch_detail(
     company_id = companies.get(_normalize(name)) if name else None
 
     new_data = json.dumps(posting, sort_keys=True)
-    _apply_data(cur, ext_id, new_data, old_data, company_id, stats)
+    _apply_data(cur, ext_id, new_data, old_data, company_id, posting, stats)
 
 
 def sweep(args) -> None:
@@ -439,6 +684,28 @@ def harvest_roster() -> None:
     print(f"Roster: upserted {len(slugs)} company slugs.")
 
 
+def regeocode() -> None:
+    """Rebuild commercial.job_locations from stored JSON for every data-bearing CJ
+    row — no network, no sitemap. Standalone like --harvest-roster."""
+    conn = psycopg2.connect(**_db_config())
+    conn.autocommit = False
+    summary: Counter[str] = Counter()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ext_id, data FROM commercial.jobs_raw "
+            "WHERE source = %s AND data IS NOT NULL ORDER BY ext_id",
+            (SOURCE,),
+        )
+        for ext_id, data in cur.fetchall():
+            summary["rows"] += 1
+            for method in _write_job_locations(cur, ext_id, data):
+                summary["locations"] += 1
+                summary[method or "unmatched"] += 1
+    conn.commit()
+    conn.close()
+    print(f"Regeocode: {dict(summary)}")
+
+
 def _keyword_list(raw: str) -> list[str]:
     return [k.strip().lower() for k in raw.split(",") if k.strip()]
 
@@ -455,6 +722,11 @@ if __name__ == "__main__":
         "--harvest-roster",
         action="store_true",
         help="Upsert the company roster from the company sitemap and exit",
+    )
+    parser.add_argument(
+        "--regeocode",
+        action="store_true",
+        help="Rebuild job_locations from stored JSON (no network) and exit",
     )
     parser.add_argument(
         "--limit",
@@ -484,5 +756,7 @@ if __name__ == "__main__":
 
     if args.harvest_roster:
         harvest_roster()
+    elif args.regeocode:
+        regeocode()
     else:
         sweep(args)
