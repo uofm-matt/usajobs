@@ -144,22 +144,28 @@ async def get_commercial_jobs(
         )
         rows = await conn.fetch(
             f"""
+            WITH page AS (
+                SELECT source, ext_id
+                FROM commercial.jobs_raw
+                WHERE {where}
+                ORDER BY data->>'datePosted' DESC NULLS LAST, ext_id
+                LIMIT {limit} OFFSET {offset}
+            )
             SELECT
-                ext_id, url,
-                data->>'title' AS title,
-                data->'hiringOrganization'->>'name' AS company,
-                data->>'securityClearanceRequirement' AS clearance,
-                data->>'employmentType' AS employment_type,
-                data->>'datePosted' AS date_posted,
-                data->>'validThrough' AS valid_through,
-                data->>'industry' AS industry,
-                data->'jobLocation' AS job_location,
-                {_SALARY_MIN} AS salary_min,
-                {_SALARY_MAX} AS salary_max
-            FROM commercial.jobs_raw
-            WHERE {where}
-            ORDER BY data->>'datePosted' DESC NULLS LAST, ext_id
-            LIMIT {limit} OFFSET {offset}
+                j.ext_id, j.url,
+                j.data->>'title' AS title,
+                j.data->'hiringOrganization'->>'name' AS company,
+                j.data->>'securityClearanceRequirement' AS clearance,
+                j.data->>'employmentType' AS employment_type,
+                j.data->>'datePosted' AS date_posted,
+                j.data->>'validThrough' AS valid_through,
+                j.data->>'industry' AS industry,
+                j.data->'jobLocation' AS job_location,
+                j.{_SALARY_MIN} AS salary_min,
+                j.{_SALARY_MAX} AS salary_max
+            FROM page
+            JOIN commercial.jobs_raw j USING (source, ext_id)
+            ORDER BY j.data->>'datePosted' DESC NULLS LAST, j.ext_id
             """,
             *params,
         )

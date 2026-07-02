@@ -46,6 +46,10 @@ REQUEST_TIMEOUT = 30
 # Politeness floor between detail fetches — max one request per second, non-negotiable.
 FETCH_DELAY = 1.0
 
+# Stop after this many back-to-back network faults — the site is likely down, so
+# bail politely instead of hammering it through the rest of the queue.
+MAX_CONSECUTIVE_ERRORS = 5
+
 DEFAULT_SLUG_KEYWORDS = [
     "engineer",
     "analyst",
@@ -195,6 +199,23 @@ def _apply_sightings(cur, seen: list[str]) -> int:
     return returned
 
 
+def _backlog_candidates(cur, keywords: list[str]) -> list[tuple[str, str]]:
+    """Never-fetched rows — this sweep's fresh inserts plus prior sweeps' leftovers
+    (deferred, non-200, mid-crash). fetched_at IS NULL is the never-attempted marker,
+    so deliberately skipped ids (_mark_id_only stamps fetched_at) don't churn."""
+    cur.execute(
+        "SELECT ext_id, url, slug FROM commercial.jobs_raw "
+        "WHERE source = %s AND data IS NULL AND fetched_at IS NULL "
+        "AND consecutive_misses = 0 ORDER BY first_seen, ext_id",
+        (SOURCE,),
+    )
+    return [
+        (ext_id, url)
+        for ext_id, url, slug in cur.fetchall()
+        if _in_scope(slug, keywords)
+    ]
+
+
 def _refresh_candidates(cur, refresh_days: int) -> list[tuple[str, str]]:
     """Data-bearing rows past their refresh age whose posting hasn't clearly expired."""
     cur.execute(
@@ -221,6 +242,16 @@ def _mark_id_only(cur, ext_id: str, stats: Counter[str], category: str) -> None:
     stats[category] += 1
 
 
+def _archive_history(cur, ext_id: str) -> None:
+    """Copy the row's current payload into jobs_history before it's overwritten."""
+    cur.execute(
+        "INSERT INTO commercial.jobs_history (source, ext_id, data, captured_at) "
+        "SELECT source, ext_id, data, last_seen FROM commercial.jobs_raw "
+        "WHERE source = %s AND ext_id = %s",
+        (SOURCE, ext_id),
+    )
+
+
 def _apply_data(
     cur,
     ext_id: str,
@@ -233,12 +264,7 @@ def _apply_data(
     if old_data is None:
         category = "fetched"
     elif old_data != new_data:
-        cur.execute(
-            "INSERT INTO commercial.jobs_history (source, ext_id, data, captured_at) "
-            "SELECT source, ext_id, data, last_seen FROM commercial.jobs_raw "
-            "WHERE source = %s AND ext_id = %s",
-            (SOURCE, ext_id),
-        )
+        _archive_history(cur, ext_id)
         category = "changed"
     else:
         category = "unchanged"
@@ -266,20 +292,6 @@ def fetch_detail(
         stats["http_error"] += 1
         return
 
-    posting = _parse_job_posting(resp.text)
-    if posting is None:
-        _mark_id_only(cur, ext_id, stats, "parse_failed")
-        return
-
-    if countries and not _country_ok(posting, countries):
-        _mark_id_only(cur, ext_id, stats, "country_skipped")
-        return
-
-    org = posting.get("hiringOrganization") or {}
-    name = org.get("name", "") if isinstance(org, dict) else ""
-    company_id = companies.get(_normalize(name)) if name else None
-
-    new_data = json.dumps(posting, sort_keys=True)
     cur.execute(
         "SELECT data FROM commercial.jobs_raw WHERE source = %s AND ext_id = %s",
         (SOURCE, ext_id),
@@ -288,6 +300,30 @@ def fetch_detail(
     old_data = (
         json.dumps(row[0], sort_keys=True) if row and row[0] is not None else None
     )
+
+    posting = _parse_job_posting(resp.text)
+    if posting is None:
+        # A refresh with good stored data: leave it untouched (fetched_at stays old,
+        # so it retries next run) rather than nulling it. Dataless rows mark id-only.
+        if old_data is None:
+            _mark_id_only(cur, ext_id, stats, "parse_failed")
+        else:
+            stats["parse_failed"] += 1
+        return
+
+    if countries and not _country_ok(posting, countries):
+        # Deliberate scope-out: archive any prior payload before nulling so the row
+        # leaves the portal without losing its history.
+        if old_data is not None:
+            _archive_history(cur, ext_id)
+        _mark_id_only(cur, ext_id, stats, "country_skipped")
+        return
+
+    org = posting.get("hiringOrganization") or {}
+    name = org.get("name", "") if isinstance(org, dict) else ""
+    company_id = companies.get(_normalize(name)) if name else None
+
+    new_data = json.dumps(posting, sort_keys=True)
     _apply_data(cur, ext_id, new_data, old_data, company_id, stats)
 
 
@@ -341,22 +377,36 @@ def sweep(args) -> None:
         )
 
         companies = _load_companies(cur)
-        new_in_scope = [
-            (eid, _job_url(eid, sitemap[eid]))
-            for eid in new
-            if _in_scope(sitemap[eid], args.slug_keywords)
-        ]
-        queue = new_in_scope + _refresh_candidates(cur, args.refresh_days)
+        backlog = _backlog_candidates(cur, args.slug_keywords)
+        refresh = _refresh_candidates(cur, args.refresh_days)
+        queue = backlog + refresh
         to_fetch = queue[: args.limit]
         print(
             f"Fetching {len(to_fetch)} detail pages "
-            f"({len(new_in_scope)} new in-scope); {len(queue) - len(to_fetch)} deferred."
+            f"({len(backlog)} backlog, {len(refresh)} refresh); "
+            f"{len(queue) - len(to_fetch)} deferred."
         )
 
+        consecutive_errors = 0
         for i, (ext_id, url) in enumerate(to_fetch):
             if i:
                 time.sleep(FETCH_DELAY)
-            fetch_detail(cur, ext_id, url, companies, args.countries, stats)
+            try:
+                fetch_detail(cur, ext_id, url, companies, args.countries, stats)
+            except requests.RequestException:
+                # No db write, so the row stays fetched_at IS NULL and the backlog
+                # retries it next run.
+                stats["fetch_error"] += 1
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    print(
+                        f"Aborting: {consecutive_errors} consecutive fetch errors — "
+                        f"site likely down. {dict(stats)}"
+                    )
+                    conn.close()
+                    sys.exit(1)
+                continue
+            consecutive_errors = 0
             conn.commit()
 
     print(f"Done. {dict(stats)}")

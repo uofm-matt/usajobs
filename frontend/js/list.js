@@ -32,6 +32,9 @@ let searchTimer = null;
 
 // Toggle between views
 mapBtn.addEventListener('click', () => {
+    // The filter panel is shared with the map view; if Commercial dimmed/hid its
+    // controls, reset to federal through setSource before revealing the map.
+    if (source === 'commercial') setSource('federal');
     active = false;
     mapEl.style.display = '';
     listPanel.style.display = 'none';

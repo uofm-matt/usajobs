@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 import cj_collect
 
@@ -216,21 +217,53 @@ class TestFetchDetail:
 
     def test_parse_failure_marks_id_only(self):
         cur = MagicMock()
+        cur.fetchone.return_value = None  # dataless row
         stats = Counter()
         with patch(
             "cj_collect.requests.get", return_value=self._resp(text="<html></html>")
         ):
             cj_collect.fetch_detail(cur, "42", "u", {}, None, stats)
         assert stats["parse_failed"] == 1
-        assert "SET data = NULL" in cur.execute.call_args_list[0].args[0]
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        assert any("SET data = NULL" in s for s in sqls)
+
+    def test_parse_failure_on_data_bearing_row_preserves_data(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = ({"title": "keep me"},)  # has stored data
+        stats = Counter()
+        with patch(
+            "cj_collect.requests.get", return_value=self._resp(text="<html></html>")
+        ):
+            cj_collect.fetch_detail(cur, "42", "u", {}, None, stats)
+        assert stats["parse_failed"] == 1
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        # Only the pre-parse SELECT ran; the row is left untouched.
+        assert all(s.startswith("SELECT data") for s in sqls)
 
     def test_country_mismatch_marks_id_only(self):
         cur = MagicMock()
+        cur.fetchone.return_value = None  # dataless row
         stats = Counter()
         with patch("cj_collect.requests.get", return_value=self._resp()):
             cj_collect.fetch_detail(cur, "42", "u", {}, ["Germany"], stats)
         assert stats["country_skipped"] == 1
-        assert "SET data = NULL" in cur.execute.call_args_list[0].args[0]
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        assert any("SET data = NULL" in s for s in sqls)
+        assert not any("jobs_history" in s for s in sqls)
+
+    def test_country_skip_on_data_bearing_row_archives_then_nulls(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = ({"title": "old"},)  # has stored data
+        stats = Counter()
+        with patch("cj_collect.requests.get", return_value=self._resp()):
+            cj_collect.fetch_detail(cur, "9990001", "u", {}, ["Germany"], stats)
+        assert stats["country_skipped"] == 1
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        hist = next(
+            i for i, s in enumerate(sqls) if "INSERT INTO commercial.jobs_history" in s
+        )
+        null = next(i for i, s in enumerate(sqls) if "SET data = NULL" in s)
+        assert hist < null  # archive precedes the null-out
 
     def test_success_links_company_and_stores_raw(self):
         cur = MagicMock()
@@ -284,12 +317,20 @@ class TestSweepGuard:
 
 
 class TestSweepSetDiff:
-    def _run(self, sitemap_entries, existing_rows, refresh_rows=None, args=None):
+    def _run(
+        self,
+        sitemap_entries,
+        existing_rows,
+        backlog_rows=None,
+        refresh_rows=None,
+        args=None,
+    ):
         conn, cur = _cursor_conn()
-        # 1st fetchall: existing (ext_id, misses); 2nd: companies; 3rd: refresh cands.
+        # fetchall order: existing (ext_id, misses); companies; backlog; refresh.
         cur.fetchall.side_effect = [
             existing_rows,
             [],  # companies
+            backlog_rows or [],
             refresh_rows or [],
         ]
         with (
@@ -302,24 +343,46 @@ class TestSweepSetDiff:
             cj_collect.sweep(args or _args())
         return conn, cur, fetch
 
-    def test_new_in_scope_queued_out_of_scope_id_only(self):
-        # engineer -> in scope (queued); mission-manager -> out (id-only insert only).
+    def test_new_ids_inserted_id_only_backlog_filters_scope(self):
+        # Both new ids are inserted id-only; the backlog query (mocked below) then
+        # yields both, and only the in-scope slug survives _in_scope filtering.
         _, cur, fetch = self._run(
             [("100", "network-engineer"), ("200", "mission-manager")],
             existing_rows=[],
+            backlog_rows=[
+                ("100", "u1", "network-engineer"),
+                ("200", "u2", "mission-manager"),
+            ],
         )
         inserts = [
             c
             for c in cur.execute.call_args_list
             if "INSERT INTO commercial.jobs_raw" in c.args[0]
         ]
-        # executemany carries both new ids as id-only rows.
-        assert not inserts  # id-only inserts go through executemany
+        # id-only inserts go through executemany, carrying both new ids.
+        assert not inserts
         rows = cur.executemany.call_args_list[0].args[1]
         assert sorted(r[1] for r in rows) == ["100", "200"]
         # Only the in-scope id is fetched.
         fetched_ids = [c.args[1] for c in fetch.call_args_list]
         assert fetched_ids == ["100"]
+
+    def test_prior_sweep_unfetched_row_reenters_queue(self):
+        # 777 is already in the DB (seen, not new) but was never fetched last sweep
+        # (data NULL, fetched_at NULL). The backlog query must re-surface it.
+        _, cur, fetch = self._run(
+            [("777", "cyber-analyst")],
+            existing_rows=[("777", 0)],
+            backlog_rows=[("777", "u777", "cyber-analyst")],
+        )
+        fetched_ids = [c.args[1] for c in fetch.call_args_list]
+        assert fetched_ids == ["777"]
+        backlog_sql = next(
+            c.args[0]
+            for c in cur.execute.call_args_list
+            if "data IS NULL" in c.args[0] and "fetched_at IS NULL" in c.args[0]
+        )
+        assert "consecutive_misses = 0" in backlog_sql
 
     def test_absent_id_increments_misses(self):
         _, cur, _ = self._run(
@@ -346,16 +409,20 @@ class TestSweepSetDiff:
 
     def test_limit_caps_fetches_and_reports_deferral(self, capsys):
         entries = [(str(i), "cyber-analyst") for i in range(5)]
-        _, _, fetch = self._run(entries, existing_rows=[], args=_args(limit=2))
+        backlog = [(str(i), f"u{i}", "cyber-analyst") for i in range(5)]
+        _, _, fetch = self._run(
+            entries, existing_rows=[], backlog_rows=backlog, args=_args(limit=2)
+        )
         assert fetch.call_count == 2
         assert "3 deferred" in capsys.readouterr().out
 
-    def test_refresh_candidates_share_queue_after_new(self):
-        # One new in-scope + two stale (seen, data-bearing) refresh candidates,
-        # limit 2 -> new first, one refresh fetched, one deferred.
+    def test_backlog_then_refresh_share_queue(self):
+        # One in-scope backlog id + two stale (data-bearing) refresh candidates,
+        # limit 2 -> backlog first, one refresh fetched, one deferred.
         _, _, fetch = self._run(
             [("100", "cyber-analyst"), ("500", "manager"), ("600", "manager")],
             existing_rows=[("500", 0), ("600", 0)],
+            backlog_rows=[("100", "u1", "cyber-analyst")],
             refresh_rows=[
                 ("500", "u5", {}),
                 ("600", "u6", {}),
@@ -364,6 +431,47 @@ class TestSweepSetDiff:
         )
         fetched_ids = [c.args[1] for c in fetch.call_args_list]
         assert fetched_ids == ["100", "500"]
+
+
+class TestFetchErrorHandling:
+    def _resp(self, status=200, text=FIXTURE):
+        r = MagicMock()
+        r.status_code = status
+        r.text = text
+        return r
+
+    def _run_sweep(self, backlog_rows, get, args=None):
+        # Real fetch_detail; requests.get is the injected mock so we can assert on
+        # its call count. Sitemap mirrors the backlog so every id is set-diffed in.
+        conn, cur = _cursor_conn()
+        cur.fetchall.side_effect = [[], [], backlog_rows, []]
+        cur.fetchone.return_value = None  # fetch_detail: no prior stored data
+        sitemap = [(eid, slug) for eid, _url, slug in backlog_rows]
+        with (
+            patch("cj_collect._fetch_sitemap_entries", return_value=sitemap),
+            patch("cj_collect.MIN_HEALTHY_SWEEP", 0),
+            patch("cj_collect.psycopg2.connect", return_value=conn),
+            patch("cj_collect.requests.get", get),
+            patch("cj_collect.time.sleep"),
+        ):
+            cj_collect.sweep(args or _args())
+
+    def test_one_timeout_continues_and_counts(self, capsys):
+        backlog = [(str(i), f"u{i}", "cyber-analyst") for i in range(3)]
+        get = MagicMock(side_effect=[requests.Timeout(), self._resp(), self._resp()])
+        self._run_sweep(backlog, get)
+        assert get.call_count == 3  # the timeout did not abort the run
+        out = capsys.readouterr().out
+        assert "'fetch_error': 1" in out and "'fetched': 2" in out
+
+    def test_five_consecutive_errors_abort(self, capsys):
+        backlog = [(str(i), f"u{i}", "cyber-analyst") for i in range(8)]
+        get = MagicMock(side_effect=[requests.ConnectionError()] * 8)
+        with pytest.raises(SystemExit) as exc:
+            self._run_sweep(backlog, get)
+        assert exc.value.code == 1
+        assert get.call_count == 5  # stopped at the 5th, no further requests
+        assert "consecutive fetch errors" in capsys.readouterr().out
 
 
 class TestHarvestRoster:
