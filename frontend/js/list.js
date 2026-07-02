@@ -24,9 +24,16 @@ const cjCompany = document.getElementById('cj-filter-company');
 const cjLocation = document.getElementById('cj-filter-location');
 const cjSalaryMin = document.getElementById('cj-filter-salary-min');
 const cjExcludeNcr = document.getElementById('cj-filter-exclude-ncr');
+const cjRemote = document.getElementById('cj-filter-remote');
 const cjClearBtn = document.getElementById('cj-filter-clear');
 const COMMERCIAL_PER_PAGE = 25;
 const SEARCH_DEBOUNCE_MS = 300;
+
+// Industry facet values that start unchecked (excluded by default). Facilities /
+// construction roles are noise for a cleared-tech search; the user can re-check.
+const CJ_DEFAULT_HIDDEN_INDUSTRIES = new Set(['Construction/Facilities']);
+const cjDefaultChecked = (facet, value) =>
+    !(facet.key === 'industry' && CJ_DEFAULT_HIDDEN_INDUSTRIES.has(value));
 
 // Faceted checkbox groups. `param` is the repeated query-param name sent to
 // /api/commercial/jobs; `field` keys into the /api/commercial/filters payload;
@@ -156,7 +163,7 @@ function buildFacetGroup(facet, options) {
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.value = opt.value;
-        cb.checked = true;
+        cb.checked = cjDefaultChecked(facet, opt.value);
         cb.addEventListener('change', commercialChanged);
         const text = document.createElement('span');
         text.textContent = `${opt.value} (${opt.count.toLocaleString()})`;
@@ -191,6 +198,7 @@ commercialSearch.addEventListener('input', () => {
 });
 
 cjExcludeNcr.addEventListener('change', commercialChanged);
+cjRemote.addEventListener('change', commercialChanged);
 
 for (const input of [cjCompany, cjLocation, cjSalaryMin]) {
     input.addEventListener('input', () => {
@@ -204,9 +212,12 @@ cjClearBtn.addEventListener('click', () => {
     cjLocation.value = '';
     cjSalaryMin.value = '';
     cjExcludeNcr.checked = false;
+    cjRemote.checked = false;
     commercialSearch.value = '';
     for (const facet of CJ_FACETS) {
-        for (const cb of facetBoxes(facet.key)) cb.checked = true;
+        for (const cb of facetBoxes(facet.key)) {
+            cb.checked = cjDefaultChecked(facet, cb.value);
+        }
     }
     commercialChanged();
 });
@@ -272,6 +283,7 @@ function appendCommercialFilters(params) {
     if (cjLocation.value.trim()) params.set('location', cjLocation.value.trim());
     if (cjSalaryMin.value) params.set('salary_min', cjSalaryMin.value);
     if (cjExcludeNcr.checked) params.set('exclude_ncr', '1');
+    if (cjRemote.checked) params.set('remote', '1');
 
     for (const facet of CJ_FACETS) {
         const boxes = facetBoxes(facet.key);

@@ -301,11 +301,15 @@ def _apply_sightings(cur, seen: list[str]) -> int:
 def _backlog_candidates(cur, keywords: list[str]) -> list[tuple[str, str]]:
     """Never-fetched rows — this sweep's fresh inserts plus prior sweeps' leftovers
     (deferred, non-200, mid-crash). fetched_at IS NULL is the never-attempted marker,
-    so deliberately skipped ids (_mark_id_only stamps fetched_at) don't churn."""
+    so deliberately skipped ids (_mark_id_only stamps fetched_at) don't churn.
+
+    Newest first: CJ ext_ids are assigned in posting order, so the highest ids are
+    the most recent postings. Fetching them first fills the (fresh, <6-month) set
+    the UI actually shows before spending the daily budget on stale evergreen ids."""
     cur.execute(
         "SELECT ext_id, url, slug FROM commercial.jobs_raw "
         "WHERE source = %s AND data IS NULL AND fetched_at IS NULL "
-        "AND consecutive_misses = 0 ORDER BY first_seen, ext_id",
+        "AND consecutive_misses = 0 ORDER BY ext_id::bigint DESC",
         (SOURCE,),
     )
     return [
@@ -430,8 +434,14 @@ def _geocode(cur, loc: dict) -> tuple[float | None, float | None, str | None]:
     postal = loc["postal"]
     if country == "United States":
         if postal and (zip5 := "".join(c for c in postal if c.isdigit())[:5]):
+            # Only trust the zip when its state agrees with the stated region.
+            # CJ has postings like ("District Of Columbia", "WA", 53201-Milwaukee)
+            # where the zip alone would drop a confident pin in the wrong state;
+            # a mismatch means the source is garbage, so fall through to the city.
             cur.execute(
-                "SELECT lat, lon FROM commercial.geo_zips WHERE zip = %s", (zip5,)
+                "SELECT lat, lon FROM commercial.geo_zips "
+                "WHERE zip = %s AND (%s = '' OR upper(state) = upper(%s))",
+                (zip5, region or "", region or ""),
             )
             if row := cur.fetchone():
                 return row[0], row[1], "zip"

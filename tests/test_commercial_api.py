@@ -12,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock
 
 from backend.api.commercial import (
+    _ACTIVE,
     NCR_LOCALITY,
     _build_where,
     _item,
@@ -22,11 +23,9 @@ from backend.api.commercial import (
 )
 from backend.main import app
 
-BASE = [
-    "source = 'clearancejobs'",
-    "data IS NOT NULL",
-    "consecutive_misses = 0",
-]
+# The base predicate clauses, derived from _ACTIVE so the freshness cut and any
+# future additions stay in sync (the pieces split cleanly on " AND ").
+BASE = _ACTIVE.split(" AND ")
 
 # Combined display label over a job_locations alias, as the loc filter, map query,
 # and locations facet all emit it.
@@ -199,6 +198,27 @@ class TestBuildWhere:
         assert where == " AND ".join(BASE)
         assert params == []
         assert "= ANY(" not in where
+
+    def test_base_predicate_cuts_stale_postings(self):
+        # The freshness cut lives in the base predicate so list, map, and facets
+        # all drop postings older than 6 months by default.
+        where, _ = _build_where()
+        assert "left(data->>'datePosted', 10) >=" in where
+        assert "now() - interval '6 months'" in where
+
+    def test_remote_matches_telecommute_flag_or_title(self):
+        where, params = _build_where(remote=True)
+        # Structured schema.org flag OR the unambiguous title words — never the bare
+        # "remote" (which also means "remote sensing"). No bound param.
+        assert "data->>'jobLocationType' = 'TELECOMMUTE'" in where
+        assert "data->>'title' ILIKE '%telecommute%'" in where
+        assert "data->>'title' ILIKE '%telework%'" in where
+        assert "'%remote%'" not in where
+        assert params == []
+
+    def test_remote_off_by_default(self):
+        where, _ = _build_where()
+        assert "TELECOMMUTE" not in where
 
     def test_exclude_ncr_filters_on_materialized_locality(self):
         where, params = _build_where(exclude_ncr=True)

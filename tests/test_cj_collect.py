@@ -419,6 +419,8 @@ class TestSweepSetDiff:
             if "data IS NULL" in c.args[0] and "fetched_at IS NULL" in c.args[0]
         )
         assert "consecutive_misses = 0" in backlog_sql
+        # Newest postings first so the fresh (<6-month) set fills before stale ids.
+        assert "ORDER BY ext_id::bigint DESC" in backlog_sql
 
     def test_absent_id_increments_misses(self):
         _, cur, _ = self._run(
@@ -659,7 +661,27 @@ class TestGeocode:
         )
         assert out == (38.9, -77.0, "zip")
         sql, params = cur.execute.call_args.args
-        assert "geo_zips" in sql and params == ("20001",)  # zip5 = first 5 digits
+        # zip5 = first 5 digits; region passed twice for the state-agreement guard.
+        assert "geo_zips" in sql and "upper(state) = upper" in sql
+        assert params == ("20001", "DC", "DC")
+
+    def test_zip_state_mismatch_falls_through_to_city(self):
+        # The Milwaukee bug: postal 53201 (WI) with region "WA". The zip query's
+        # state guard rejects it (fetchone None), so it falls back to the city.
+        cur = MagicMock()
+        cur.fetchone.side_effect = [None, (47.6, -122.3)]  # zip guarded out, city hit
+        out = cj_collect._geocode(
+            cur,
+            {
+                "city": "Seattle",
+                "region": "WA",
+                "country": "United States",
+                "postal": "53201",
+            },
+        )
+        assert out == (47.6, -122.3, "city")
+        zip_params = cur.execute.call_args_list[0].args[1]
+        assert zip_params == ("53201", "WA", "WA")
 
     def test_us_falls_back_to_city_when_zip_misses(self):
         cur = MagicMock()

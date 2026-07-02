@@ -32,7 +32,16 @@ _NUMERIC = r"^[0-9]+(\.[0-9]+)?$"
 
 _SORT_ORDERS = ("asc", "desc")
 
-_ACTIVE = "source = 'clearancejobs' AND data IS NOT NULL AND consecutive_misses = 0"
+# Active = fetched (data present) and still in the latest sitemap sweep, AND posted
+# within the last 6 months. CJ keeps stale evergreen listings in the sitemap
+# indefinitely (2016 postings still appear) and their data is often garbage, so the
+# freshness cut removes them everywhere. Lexicographic compare on the ISO date prefix
+# (== chronological); now() makes the cutoff per-request; undated postings are kept.
+_ACTIVE = (
+    "source = 'clearancejobs' AND data IS NOT NULL AND consecutive_misses = 0 "
+    "AND (data->>'datePosted' IS NULL "
+    "OR left(data->>'datePosted', 10) >= to_char(now() - interval '6 months', 'YYYY-MM-DD'))"
+)
 
 # jobLocation is usually a list of Places but can be a single Place object;
 # normalize both to a jsonb array so jsonb_array_elements can unnest it.
@@ -161,6 +170,7 @@ def _build_where(
     location=None,
     loc=None,
     exclude_ncr=False,
+    remote=False,
 ) -> tuple[str, list]:
     """WHERE clause + $N-bound params for active CJ postings with detail data.
 
@@ -248,6 +258,16 @@ def _build_where(
             "WHERE lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id "
             f"AND {_label_expr('lo')} = ANY(${len(params)}))"
         )
+    if remote:
+        # CJ flags remote work with schema.org jobLocationType=TELECOMMUTE and
+        # appends "Remote / Telecommute" to the title. Match those two unambiguous
+        # words (not the bare "remote", which also means "remote sensing"). No
+        # bound param — all literals — so it never shifts the $N numbering.
+        clauses.append(
+            "(data->>'jobLocationType' = 'TELECOMMUTE' "
+            "OR data->>'title' ILIKE '%telecommute%' "
+            "OR data->>'title' ILIKE '%telework%')"
+        )
 
     return " AND ".join(clauses), params
 
@@ -272,9 +292,12 @@ def _locations(job_location) -> tuple[list[str], list[str]]:
     countries: list[str] = []
     for place in places:
         addr = place.get("address") or {}
-        if label := ", ".join(
-            p for p in (addr.get("addressLocality"), addr.get("addressRegion")) if p
-        ):
+        # CJ stores localities inconsistently cased ("virginia", "MCLEAN"); title-case
+        # the city and upper-case the region so the card reads like the normalized
+        # job_locations the map and facets already display.
+        city = (addr.get("addressLocality") or "").strip().title()
+        region = (addr.get("addressRegion") or "").strip().upper()
+        if label := ", ".join(p for p in (city, region) if p):
             locs.append(label)
         if (c := addr.get("addressCountry")) and c not in countries:
             countries.append(c)
@@ -335,6 +358,7 @@ async def get_commercial_jobs(
     location: Annotated[str | None, Query()] = None,
     loc: Annotated[list[str] | None, Query()] = None,
     exclude_ncr: Annotated[bool, Query()] = False,
+    remote: Annotated[bool, Query()] = False,
     sort: Annotated[str, Query()] = "posted",
     order: Annotated[str, Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
@@ -364,6 +388,7 @@ async def get_commercial_jobs(
         location=location,
         loc=loc,
         exclude_ncr=exclude_ncr,
+        remote=remote,
     )
 
     pool = get_pool()
@@ -423,6 +448,7 @@ async def get_commercial_map(
     location: Annotated[str | None, Query()] = None,
     loc: Annotated[list[str] | None, Query()] = None,
     exclude_ncr: Annotated[bool, Query()] = False,
+    remote: Annotated[bool, Query()] = False,
 ):
     """Map points for the same active+filtered CJ set as /api/commercial/jobs.
 
@@ -451,6 +477,7 @@ async def get_commercial_map(
         location=location,
         loc=loc,
         exclude_ncr=exclude_ncr,
+        remote=remote,
     )
     n = len(params)
     params.extend([west, south, east, north])
