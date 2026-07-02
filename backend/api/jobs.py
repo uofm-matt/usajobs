@@ -8,7 +8,7 @@ from fastapi import APIRouter, Query, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from backend.api.filters import build_content_where
+from backend.api.filters import _parse_bbox, build_content_where
 from backend.api.filters import DOD_DEPARTMENTS as DOD_DEPARTMENTS
 from backend.api.filters import NCR_LOCALITY as NCR_LOCALITY
 from backend.db import get_pool
@@ -31,27 +31,9 @@ MAX_INDIVIDUAL = 2000
 MAX_CLUSTERS = 150
 
 
-def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
-    """Parse and validate bbox string 'west,south,east,north'."""
-    parts = bbox.split(",")
-    if len(parts) != 4:
-        raise ValueError(
-            "bbox must have 4 comma-separated values: west,south,east,north"
-        )
-    west, south, east, north = (float(p) for p in parts)
-    # Clamp longitudes to [-180, 180] — Leaflet can exceed this when map wraps
-    west = max(-180.0, min(180.0, west))
-    east = max(-180.0, min(180.0, east))
-    if not (-90 <= south <= 90 and -90 <= north <= 90):
-        raise ValueError("latitude must be between -90 and 90")
-    if west >= east:
-        # Map wrapped around — use full longitude range
-        west, east = -180.0, 180.0
-    if south >= north:
-        raise ValueError("south must be less than north")
-    return west, south, east, north
-
-
+# Deliberately ordered differently from filters._WHERE_ORDER: each endpoint's
+# historical clause order fixes its $N param numbering, so the two lists must
+# stay separate to keep emitted SQL byte-identical.
 _CONTENT_ORDER = (
     "department",
     "agency",
@@ -93,7 +75,25 @@ def _build_content_filters(
     exclude_providers=False,
 ) -> tuple[str, list]:
     """Append content filter clauses (shared by spatial and list queries)."""
-    return build_content_where(_CONTENT_ORDER, locals(), clauses, params)
+    values = {
+        "department": department,
+        "agency": agency,
+        "grade_min": grade_min,
+        "grade_max": grade_max,
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "clearance": clearance,
+        "keyword": keyword,
+        "state": state,
+        "country": country,
+        "city": city,
+        "series": series,
+        "locality": locality,
+        "exclude_ncr": exclude_ncr,
+        "exclude_registers": exclude_registers,
+        "exclude_providers": exclude_providers,
+    }
+    return build_content_where(_CONTENT_ORDER, values, clauses, params)
 
 
 def _build_filters(
@@ -229,8 +229,8 @@ def _format_grade(row) -> str:
     return grade
 
 
-async def _fetch_individual(conn, where: str, params: list) -> dict:
-    """Fetch individual points as GeoJSON."""
+async def _fetch_individual(conn, where: str, params: list) -> list[dict]:
+    """Fetch individual points as GeoJSON Feature dicts."""
     sql = f"""
         SELECT
             position_id, title, org, department,
@@ -364,7 +364,7 @@ async def get_jobs(
         west, south, east, north = _parse_bbox(bbox)
     except ValueError as e:
         return Response(
-            content=f'{{"error": "{e}", "code": 422}}',
+            content=json.dumps({"error": str(e), "code": 422}),
             status_code=422,
             media_type="application/json",
         )
@@ -508,7 +508,7 @@ async def get_jobs_list(
                 series_code, series_name
             FROM jobs_geo
             WHERE {where}
-            ORDER BY position_id
+            ORDER BY position_id, location_name
         """
         sql = f"""
             SELECT * FROM ({sql}) AS jobs

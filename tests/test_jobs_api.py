@@ -52,7 +52,7 @@ class TestParameterization:
 
     def test_no_fstring_interpolation_in_sql(self):
         """Source code of query functions must not interpolate user filter values."""
-        for fn in [_build_filters, _fetch_individual, _fetch_clusters]:
+        for fn in [_fetch_individual, _fetch_clusters]:
             source = inspect.getsource(fn)
             # Should not have f-string interpolation of filter variable names
             # (allowed: {where}, {MAX_INDIVIDUAL}, {next_param} which are internal)
@@ -116,19 +116,6 @@ class TestJobsResponseFormat:
             assert "title" in props
             assert "org" in props
 
-    async def test_cluster_properties(self, client):
-        """At low zoom covering CONUS, features should be clusters."""
-        r = await client.get(
-            "/api/jobs", params={"bbox": "-130,25,-65,50", "zoom": "4"}
-        )
-        data = r.json()
-        assert data["metadata"]["clustered"] is True
-        if data["features"]:
-            props = data["features"][0]["properties"]
-            assert props["cluster"] is True
-            assert "point_count" in props
-            assert isinstance(props["point_count"], int)
-
     async def test_filters_applied(self, client):
         """Keyword filter should restrict results."""
         r_all = await client.get(
@@ -178,3 +165,34 @@ class TestJobDetail:
         ]:
             assert field in job, f"Missing field: {field}"
         assert isinstance(job["locations"], list)
+
+
+# --- /api/jobs clustering branches ---
+
+
+class TestClustering:
+    async def test_low_zoom_conus_clusters(self, client):
+        r = await client.get(
+            "/api/jobs", params={"bbox": "-130,25,-65,50", "zoom": "4"}
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["metadata"]["clustered"] is True
+        if data["features"]:
+            props = data["features"][0]["properties"]
+            assert props["cluster"] is True
+            assert isinstance(props["point_count"], int)
+            assert "top_agency" in props
+
+    async def test_tight_bbox_high_zoom_individual(self, client):
+        r = await client.get(
+            "/api/jobs", params={"bbox": "-77.04,38.89,-77.02,38.91", "zoom": "16"}
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["metadata"]["clustered"] is False
+        if data["features"]:
+            feat = data["features"][0]
+            assert feat["geometry"]["type"] == "Point"
+            assert "cluster" not in feat["properties"]
+            assert "id" in feat["properties"]

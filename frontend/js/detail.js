@@ -4,6 +4,8 @@
  */
 import { fetchJSON, formatDate } from './api.js';
 
+const TRAVEL_LABELS = { '0': 'Not required', '1': 'Occasional travel', '2': '25% or less', '3': '50% or greater', '5': '50% or less', '7': '75% or less', '8': '76% or greater' };
+
 const panel = document.getElementById('detail-panel');
 const closeBtn = document.getElementById('detail-close');
 
@@ -69,8 +71,8 @@ function render(job) {
     const closeDate = formatDate(job.close_date);
     datesEl.textContent = openDate && closeDate ? `${openDate} – ${closeDate}` : 'N/A';
 
-    travelEl.textContent = job.travel || 'Not specified';
-    teleworkEl.textContent = job.telework || 'Not specified';
+    travelEl.textContent = TRAVEL_LABELS[job.travel] || 'Not specified';
+    teleworkEl.textContent = typeof job.telework === 'boolean' ? (job.telework ? 'Yes' : 'No') : 'Not specified';
     promoEl.textContent = job.promotion_potential || 'N/A';
     hiringEl.textContent = (job.hiring_paths || []).join(', ') || 'N/A';
 

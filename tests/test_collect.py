@@ -277,6 +277,7 @@ class TestCollectFull:
 
         with (
             patch("collect.psycopg2.connect", return_value=conn),
+            patch("collect.MIN_HEALTHY_SWEEP", 0),
             patch(
                 "collect.get_locations_from_api",
                 return_value=(["California"], ["Germany"]),
@@ -312,6 +313,7 @@ class TestCollectFull:
 
         with (
             patch("collect.psycopg2.connect", return_value=conn),
+            patch("collect.MIN_HEALTHY_SWEEP", 0),
             patch(
                 "collect.get_locations_from_api",
                 return_value=(["California"], []),

@@ -41,6 +41,10 @@ MIN_HEALTHY_SWEEP = 3000
 # Page size requested from the API; also drives the pagination stop condition.
 RESULTS_PER_PAGE = 500
 
+# Seconds per socket op; a hang becomes requests.Timeout and fails the sweep
+# like any other network error.
+REQUEST_TIMEOUT = 30
+
 
 def _db_config(url_env: str = "DATABASE_URL_COLLECTOR") -> dict:
     """Parse a DATABASE_URL into psycopg2 connection kwargs."""
@@ -57,7 +61,9 @@ def _db_config(url_env: str = "DATABASE_URL_COLLECTOR") -> dict:
 
 def _codelist(slug: str) -> list[dict]:
     """Fetch one of the API's master code lists and return its valid values."""
-    resp = requests.get(f"{CODELIST_URL}/{slug}", headers=HEADERS)
+    resp = requests.get(
+        f"{CODELIST_URL}/{slug}", headers=HEADERS, timeout=REQUEST_TIMEOUT
+    )
     resp.raise_for_status()
     return resp.json()["CodeList"][0]["ValidValue"]
 
@@ -119,7 +125,9 @@ def search_pages(params: dict, max_pages: int = 20) -> Iterator[dict]:
 
     while params["Page"] <= max_pages:
         print(f"  Fetching page {params['Page']}...")
-        resp = requests.get(BASE_URL, headers=HEADERS, params=params)
+        resp = requests.get(
+            BASE_URL, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT
+        )
         resp.raise_for_status()
 
         sr = resp.json().get("SearchResult", {})

@@ -185,6 +185,7 @@ async function refreshFilterOptions() {
         localityBounds = data.locality_bounds || {};
         populateCities();
     } catch (err) {
+        if (err.name === 'AbortError') return; // Cancelled — ignore
         console.error('Failed to load filters:', err);
     }
 }

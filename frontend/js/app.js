@@ -45,15 +45,21 @@ async function initMap() {
     });
 
     // Use Google Maps tiles if API key is available, otherwise CartoDB/OSM
+    const addFallbackTiles = () => L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+        maxZoom: 19,
+    }).addTo(map);
+
     if (config.google_maps_api_key) {
-        await loadScript(`https://maps.googleapis.com/maps/api/js?key=${config.google_maps_api_key}`);
-        await loadScript('https://unpkg.com/leaflet.gridlayer.googlemutant@0.14.1/dist/Leaflet.GoogleMutant.js');
-        L.gridLayer.googleMutant({ type: 'roadmap' }).addTo(map);
+        try {
+            await loadScript(`https://maps.googleapis.com/maps/api/js?key=${config.google_maps_api_key}`);
+            await loadScript('https://unpkg.com/leaflet.gridlayer.googlemutant@0.14.1/dist/Leaflet.GoogleMutant.js');
+            L.gridLayer.googleMutant({ type: 'roadmap' }).addTo(map);
+        } catch {
+            addFallbackTiles();
+        }
     } else {
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
-            maxZoom: 19,
-        }).addTo(map);
+        addFallbackTiles();
     }
 
     // Layer for job markers
@@ -109,11 +115,10 @@ async function loadJobs(fromFilter = false) {
         const geojson = await fetchJSON(url, { key: 'jobs' });
         renderJobs(geojson);
     } catch (err) {
-        if (err.name === 'AbortError') return; // Cancelled — ignore
+        if (err.name === 'AbortError') return; // Cancelled — superseding call owns the spinner
         showToast(`Failed to load jobs: ${err.message}`);
-    } finally {
-        setLoading(false);
     }
+    setLoading(false);
 }
 
 /** Render GeoJSON features on the map */
@@ -122,7 +127,6 @@ function renderJobs(geojson) {
 
     const meta = geojson.metadata || {};
     const total = meta.total ?? geojson.features.length;
-    const clustered = meta.clustered || false;
 
     jobCountEl.textContent = `${pluralJobs(total)} in view`;
 

@@ -1,4 +1,4 @@
-"""Tests for GET /api/jobs/list, the shared filter builders, and clustering branches."""
+"""Tests for GET /api/jobs/list and the shared filter builders."""
 
 import pytest
 
@@ -330,34 +330,3 @@ class TestJobsListFilters:
         base = await self._total(client)
         filtered = await self._total(client, clearance="Secret")
         assert filtered <= base
-
-
-# --- /api/jobs clustering branches ---
-
-
-class TestClustering:
-    async def test_low_zoom_conus_clusters(self, client):
-        r = await client.get(
-            "/api/jobs", params={"bbox": "-130,25,-65,50", "zoom": "4"}
-        )
-        assert r.status_code == 200
-        data = r.json()
-        assert data["metadata"]["clustered"] is True
-        if data["features"]:
-            props = data["features"][0]["properties"]
-            assert props["cluster"] is True
-            assert isinstance(props["point_count"], int)
-            assert "top_agency" in props
-
-    async def test_tight_bbox_high_zoom_individual(self, client):
-        r = await client.get(
-            "/api/jobs", params={"bbox": "-77.04,38.89,-77.02,38.91", "zoom": "16"}
-        )
-        assert r.status_code == 200
-        data = r.json()
-        assert data["metadata"]["clustered"] is False
-        if data["features"]:
-            feat = data["features"][0]
-            assert feat["geometry"]["type"] == "Point"
-            assert "cluster" not in feat["properties"]
-            assert "id" in feat["properties"]

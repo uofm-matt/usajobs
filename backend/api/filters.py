@@ -29,6 +29,27 @@ DOD_DEPARTMENTS = [
 ]
 
 
+def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
+    """Parse and validate bbox string 'west,south,east,north'."""
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        raise ValueError(
+            "bbox must have 4 comma-separated values: west,south,east,north"
+        )
+    west, south, east, north = (float(p) for p in parts)
+    # Clamp longitudes to [-180, 180] — Leaflet can exceed this when map wraps
+    west = max(-180.0, min(180.0, west))
+    east = max(-180.0, min(180.0, east))
+    if not (-90 <= south <= 90 and -90 <= north <= 90):
+        raise ValueError("latitude must be between -90 and 90")
+    if west >= east:
+        # Map wrapped around — use full longitude range
+        west, east = -180.0, 180.0
+    if south >= north:
+        raise ValueError("south must be less than north")
+    return west, south, east, north
+
+
 NCR_LOCALITY = "Washington-Baltimore-Arlington, DC-MD-VA-WV-PA"
 # Doctoral/licensed clinical providers (physicians, behavioral-health, therapists,
 # PA/pharmacist, etc.); exclude_providers hides these and keeps support/techs/admin.
@@ -122,6 +143,9 @@ def build_content_where(
     return " AND ".join(clauses), params
 
 
+# Deliberately ordered differently from jobs._CONTENT_ORDER: each endpoint's
+# historical clause order fixes its $N param numbering, so the two lists must
+# stay separate to keep emitted SQL byte-identical.
 _WHERE_ORDER = (
     "department",
     "agency",
@@ -168,7 +192,25 @@ def _build_where(
         west, south, east, north = bbox
         clauses.append("geom && ST_MakeEnvelope($1, $2, $3, $4, 4326)")
         params.extend([west, south, east, north])
-    where, params = build_content_where(_WHERE_ORDER, locals(), clauses, params)
+    values = {
+        "department": department,
+        "agency": agency,
+        "clearance": clearance,
+        "state": state,
+        "country": country,
+        "city": city,
+        "keyword": keyword,
+        "grade_min": grade_min,
+        "grade_max": grade_max,
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "series": series,
+        "locality": locality,
+        "exclude_ncr": exclude_ncr,
+        "exclude_registers": exclude_registers,
+        "exclude_providers": exclude_providers,
+    }
+    where, params = build_content_where(_WHERE_ORDER, values, clauses, params)
     return (where or "TRUE"), params
 
 
@@ -352,7 +394,7 @@ async def get_filters(
 
     has_filters = (
         any(
-            v is not None
+            v is not None and v != ""
             for v in [
                 department,
                 agency,
@@ -392,8 +434,7 @@ async def get_filters(
         bbox_coords = None
         if bbox:
             try:
-                parts = [float(x) for x in bbox.split(",")]
-                bbox_coords = tuple(parts) if len(parts) == 4 else None
+                bbox_coords = _parse_bbox(bbox)
             except ValueError:
                 bbox_coords = None
         where, params = _build_where(
