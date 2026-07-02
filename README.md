@@ -26,7 +26,10 @@ collector that sweeps the USAJobs Search API on an hourly full sweep.
   health); asyncpg pool in `db.py`.
 - `frontend/` — static `index.html`, `js/`, `css/`.
 - `collect.py` — USAJobs API ingester (full sweep).
-- `migrations/` — ordered SQL migrations (01–07). `schema.sql` is a snapshot
+- `cj_collect.py` — ClearanceJobs ingester into the separate `commercial`
+  schema (sitemap-driven sightings + rate-limited detail fetches; collected
+  data is personal-use only and never republished).
+- `migrations/` — ordered SQL migrations (01–08). `schema.sql` is a snapshot
   of the live schema; usable as the baseline for a fresh database (see
   Database setup).
 - `scripts/analyze_jobs.py` — offline posting analysis via the Claude API
@@ -40,9 +43,9 @@ Requires PostgreSQL 17 with PostGIS. Two setup paths:
 
 - Fresh database: create the `usajobs` database and the two app roles, then
   apply `schema.sql` as the baseline — it is a snapshot of the live schema
-  (regenerated 2026-07-02) and already includes everything migrations 01–07
+  (regenerated 2026-07-02) and already includes everything migrations 01–08
   produce. Do not also run the migrations afterwards.
-- Existing database: apply `migrations/01` … `migrations/07` in order and skip
+- Existing database: apply `migrations/01` … `migrations/08` in order and skip
   `schema.sql`.
 
 Fresh-database walkthrough (as a superuser):

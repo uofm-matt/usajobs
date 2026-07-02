@@ -417,7 +417,8 @@ html, body {
 }
 
 /* ── View toggle ── */
-#view-toggle {
+#view-toggle,
+#source-toggle {
     display: flex;
     background: var(--color-hover-bg);
     border-radius: 4px;
@@ -467,6 +468,35 @@ html, body {
     background: #fff;
     border-bottom: 1px solid var(--color-border);
     flex-shrink: 0;
+}
+
+.list-header-left,
+.list-header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+#commercial-search {
+    padding: 5px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+    width: 200px;
+}
+
+#commercial-search:focus {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 2px rgba(21, 101, 192, 0.15);
+}
+
+/* Federal filters don't apply to commercial listings — dim them out */
+#filter-panel.source-disabled .filter-body {
+    opacity: 0.4;
+    pointer-events: none;
 }
 
 #list-count {

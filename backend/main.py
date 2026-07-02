@@ -11,6 +11,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from backend.api.commercial import router as commercial_router
 from backend.api.config import router as config_router
 from backend.api.filters import router as filters_router
 from backend.api.health import router as health_router
@@ -76,6 +77,7 @@ app.include_router(health_router)
 app.include_router(config_router)
 app.include_router(filters_router)
 app.include_router(jobs_router)
+app.include_router(commercial_router)
 
 # Static files (frontend only — never project root)
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")

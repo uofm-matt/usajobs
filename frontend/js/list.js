@@ -15,11 +15,20 @@ const mapBtn = document.getElementById('view-map');
 const listBtn = document.getElementById('view-list');
 const sortField = document.getElementById('list-sort-field');
 const sortOrderBtn = document.getElementById('list-sort-order');
+const filterPanel = document.getElementById('filter-panel');
+const listSort = document.getElementById('list-sort');
+const federalBtn = document.getElementById('source-federal');
+const commercialBtn = document.getElementById('source-commercial');
+const commercialSearch = document.getElementById('commercial-search');
+const COMMERCIAL_PER_PAGE = 25;
+const SEARCH_DEBOUNCE_MS = 300;
 
 let currentPage = 1;
 let sortOrder = 'desc';
 let active = false;
 let mapBbox = null;
+let source = 'federal';
+let searchTimer = null;
 
 // Toggle between views
 mapBtn.addEventListener('click', () => {
@@ -40,6 +49,32 @@ listBtn.addEventListener('click', () => {
     listBtn.classList.add('active');
     currentPage = 1;
     loadList();
+});
+
+federalBtn.addEventListener('click', () => setSource('federal'));
+commercialBtn.addEventListener('click', () => setSource('commercial'));
+
+// Commercial (ClearanceJobs) is a list-only source: only the free-text search
+// applies, so the federal filters and sort controls are dimmed/hidden.
+function setSource(next) {
+    if (source === next) return;
+    source = next;
+    const commercial = next === 'commercial';
+    federalBtn.classList.toggle('active', !commercial);
+    commercialBtn.classList.toggle('active', commercial);
+    filterPanel.classList.toggle('source-disabled', commercial);
+    listSort.style.display = commercial ? 'none' : '';
+    commercialSearch.style.display = commercial ? '' : 'none';
+    currentPage = 1;
+    loadList();
+}
+
+commercialSearch.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+        currentPage = 1;
+        loadList();
+    }, SEARCH_DEBOUNCE_MS);
 });
 
 sortField.addEventListener('change', () => {
@@ -72,6 +107,8 @@ window.addEventListener('map-moved', (e) => {
 });
 
 async function loadList() {
+    if (source === 'commercial') return loadCommercial();
+
     const filterStr = getFilterParams();
     let url = `/api/jobs/list?page=${currentPage}&per_page=25&sort=${sortField.value}&order=${sortOrder}`;
     if (mapBbox) url += `&bbox=${mapBbox}`;
@@ -86,6 +123,67 @@ async function loadList() {
         if (err.name === 'AbortError') return;
         listBody.innerHTML = `<div class="list-loading">Failed to load: ${escapeHTML(err.message)}</div>`;
     }
+}
+
+async function loadCommercial() {
+    const params = new URLSearchParams({
+        limit: COMMERCIAL_PER_PAGE,
+        offset: (currentPage - 1) * COMMERCIAL_PER_PAGE,
+    });
+    const keyword = commercialSearch.value.trim();
+    if (keyword) params.set('q', keyword);
+
+    listBody.innerHTML = '<div class="list-loading">Loading...</div>';
+
+    try {
+        const data = await fetchJSON(`/api/commercial/jobs?${params}`, { key: 'list' });
+        renderCommercial(data);
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        listBody.innerHTML = `<div class="list-loading">Failed to load: ${escapeHTML(err.message)}</div>`;
+    }
+}
+
+function renderCommercial(data) {
+    listCount.textContent = pluralJobs(data.total);
+
+    if (data.jobs.length === 0) {
+        listBody.innerHTML = '<div class="list-empty">No commercial jobs match your search.</div>';
+        listPagination.innerHTML = '';
+        return;
+    }
+
+    listBody.innerHTML = '';
+    for (const job of data.jobs) {
+        const card = document.createElement('div');
+        card.className = 'job-card';
+        // No detail pane for commercial in P1 — open the ClearanceJobs posting directly
+        card.addEventListener('click', () => window.open(job.url, '_blank', 'noopener'));
+
+        const location = (job.locations && job.locations[0]) || 'N/A';
+        const posted = formatDate(job.date_posted);
+
+        card.innerHTML = `
+            <div class="job-card-main">
+                <div class="job-card-title">${escapeHTML(job.title)}</div>
+                <div class="job-card-org">${escapeHTML(job.company || '')}</div>
+            </div>
+            <div class="job-card-details">
+                <div class="job-card-meta">
+                    <span class="job-meta-item job-meta-location">${escapeHTML(location)}</span>
+                    ${job.industry ? `<span class="job-meta-item">${escapeHTML(job.industry)}</span>` : ''}
+                    ${job.clearance ? `<span class="job-meta-item job-meta-clearance">${escapeHTML(job.clearance)}</span>` : ''}
+                </div>
+                <div class="job-card-footer">
+                    <span class="job-card-close">${posted ? `Posted ${posted}` : ''}</span>
+                </div>
+            </div>
+        `;
+        listBody.appendChild(card);
+    }
+
+    const pages = data.total ? Math.ceil(data.total / (data.limit || COMMERCIAL_PER_PAGE)) : 0;
+    renderPagination({ page: currentPage, pages });
 }
 
 function renderList(data) {

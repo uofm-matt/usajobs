@@ -143,18 +143,27 @@
     <!-- List view -->
     <div id="list-panel" style="display:none">
         <div id="list-header">
-            <span id="list-count"></span>
-            <div id="list-sort">
-                <select id="list-sort-field">
-                    <option value="close_date">Close Date</option>
-                    <option value="salary" selected>Salary</option>
-                    <option value="grade">Grade</option>
-                    <option value="title">Title</option>
-                    <option value="org">Agency</option>
-                    <option value="series">Series</option>
-                    <option value="location">Location</option>
-                </select>
-                <button id="list-sort-order" title="Toggle sort order">&uarr;</button>
+            <div class="list-header-left">
+                <div id="source-toggle">
+                    <button id="source-federal" class="view-btn active" title="Federal (USAJobs)">Federal</button>
+                    <button id="source-commercial" class="view-btn" title="Commercial (ClearanceJobs)">Commercial</button>
+                </div>
+                <span id="list-count"></span>
+            </div>
+            <div class="list-header-right">
+                <input type="text" id="commercial-search" placeholder="Search commercial jobs" style="display:none">
+                <div id="list-sort">
+                    <select id="list-sort-field">
+                        <option value="close_date">Close Date</option>
+                        <option value="salary" selected>Salary</option>
+                        <option value="grade">Grade</option>
+                        <option value="title">Title</option>
+                        <option value="org">Agency</option>
+                        <option value="series">Series</option>
+                        <option value="location">Location</option>
+                    </select>
+                    <button id="list-sort-order" title="Toggle sort order">&uarr;</button>
+                </div>
             </div>
         </div>
         <div id="list-body"></div>
