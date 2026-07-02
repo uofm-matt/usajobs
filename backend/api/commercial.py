@@ -139,6 +139,8 @@ def _build_where(
     clearance=None,
     company=None,
     country=None,
+    industry=None,
+    employment_type=None,
     q=None,
     salary_min=None,
     location=None,
@@ -149,23 +151,33 @@ def _build_where(
     Base predicate keeps id-only sightings and missed-sweep rows out: a row is
     surfaced only once its detail page is fetched (data IS NOT NULL) and it is
     still present in the latest sitemap sweep (consecutive_misses = 0).
+
+    clearance/country/industry/employment_type are multi-value: each takes a list
+    matched with `= ANY($N)` (one text[] param), values coming verbatim from the
+    facet endpoint so exact matching is correct. country matches over the
+    normalized jobLocation array, so a job on any listed country surfaces.
     """
     clauses = [_ACTIVE]
     params: list = []
 
     if clearance:
         params.append(clearance)
-        clauses.append(f"data->>'securityClearanceRequirement' ILIKE ${len(params)}")
+        clauses.append(f"data->>'securityClearanceRequirement' = ANY(${len(params)})")
     if company:
         params.append(f"%{company}%")
         clauses.append(f"data->'hiringOrganization'->>'name' ILIKE ${len(params)}")
     if country:
         params.append(country)
         clauses.append(
-            "jsonb_path_exists(data, "
-            "'$.jobLocation[*].address.addressCountry ? (@ == $c)', "
-            f"jsonb_build_object('c', ${len(params)}::text))"
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
+            f"WHERE loc->'address'->>'addressCountry' = ANY(${len(params)}))"
         )
+    if industry:
+        params.append(industry)
+        clauses.append(f"data->>'industry' = ANY(${len(params)})")
+    if employment_type:
+        params.append(employment_type)
+        clauses.append(f"data->>'employmentType' = ANY(${len(params)})")
     if q:
         params.append(f"%{q}%")
         n = len(params)
@@ -257,9 +269,11 @@ def _item(row) -> dict:
 @limiter.limit("120/minute")
 async def get_commercial_jobs(
     request: Request,
-    clearance: Annotated[str | None, Query()] = None,
+    clearance: Annotated[list[str] | None, Query()] = None,
     company: Annotated[str | None, Query()] = None,
-    country: Annotated[str | None, Query()] = None,
+    country: Annotated[list[str] | None, Query()] = None,
+    industry: Annotated[list[str] | None, Query()] = None,
+    employment_type: Annotated[list[str] | None, Query()] = None,
     q: Annotated[str | None, Query()] = None,
     salary_min: Annotated[int | None, Query(ge=0)] = None,
     location: Annotated[str | None, Query()] = None,
@@ -284,6 +298,8 @@ async def get_commercial_jobs(
         clearance=clearance,
         company=company,
         country=country,
+        industry=industry,
+        employment_type=employment_type,
         q=q,
         salary_min=salary_min,
         location=location,
@@ -334,7 +350,8 @@ async def get_commercial_jobs(
 @router.get("/api/commercial/filters")
 @limiter.limit("120/minute")
 async def get_commercial_filters(request: Request):
-    """Facet options (clearance, country) over the active CJ posting set.
+    """Facet options (clearance, country, industry, employment type) over the
+    active CJ posting set.
 
     Country counts are per-job: a posting with several locations in one country
     counts once, matching how the country filter surfaces a job on any match.
@@ -354,7 +371,23 @@ async def get_commercial_filters(request: Request):
             f"WHERE {_ACTIVE}) sub "
             "WHERE value IS NOT NULL GROUP BY value ORDER BY c DESC, value"
         )
+        industries = await conn.fetch(
+            "SELECT data->>'industry' AS value, COUNT(*) AS c "
+            f"FROM commercial.jobs_raw WHERE {_ACTIVE} "
+            "AND data->>'industry' IS NOT NULL "
+            "GROUP BY value ORDER BY c DESC, value"
+        )
+        employment_types = await conn.fetch(
+            "SELECT data->>'employmentType' AS value, COUNT(*) AS c "
+            f"FROM commercial.jobs_raw WHERE {_ACTIVE} "
+            "AND data->>'employmentType' IS NOT NULL "
+            "GROUP BY value ORDER BY c DESC, value"
+        )
     return {
         "clearances": [{"value": r["value"], "count": r["c"]} for r in clearances],
         "countries": [{"value": r["value"], "count": r["c"]} for r in countries],
+        "industries": [{"value": r["value"], "count": r["c"]} for r in industries],
+        "employment_types": [
+            {"value": r["value"], "count": r["c"]} for r in employment_types
+        ],
     }

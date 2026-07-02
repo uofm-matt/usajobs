@@ -20,8 +20,6 @@ const commercialFilters = document.getElementById('commercial-filters');
 const federalBtn = document.getElementById('source-federal');
 const commercialBtn = document.getElementById('source-commercial');
 const commercialSearch = document.getElementById('commercial-search');
-const cjClearance = document.getElementById('cj-filter-clearance');
-const cjCountry = document.getElementById('cj-filter-country');
 const cjCompany = document.getElementById('cj-filter-company');
 const cjLocation = document.getElementById('cj-filter-location');
 const cjSalaryMin = document.getElementById('cj-filter-salary-min');
@@ -29,6 +27,19 @@ const cjExcludeNcr = document.getElementById('cj-filter-exclude-ncr');
 const cjClearBtn = document.getElementById('cj-filter-clear');
 const COMMERCIAL_PER_PAGE = 25;
 const SEARCH_DEBOUNCE_MS = 300;
+
+// Faceted checkbox groups. `param` is the repeated query-param name sent to
+// /api/commercial/jobs; `field` keys into the /api/commercial/filters payload;
+// `body` is the container the checkboxes render into (id cj-facet-<key>).
+const CJ_FACETS = [
+    { key: 'clearance', param: 'clearance', field: 'clearances' },
+    { key: 'country', param: 'country', field: 'countries' },
+    { key: 'industry', param: 'industry', field: 'industries' },
+    { key: 'employment_type', param: 'employment_type', field: 'employment_types' },
+];
+const cjFacetBodies = Object.fromEntries(
+    CJ_FACETS.map((f) => [f.key, document.getElementById(`cj-facet-${f.key}`)]),
+);
 
 // Federal options come from the HTML; commercial swaps in its own set on source
 // change. Keep the original markup and prior selection to restore on switch back.
@@ -109,8 +120,7 @@ async function loadCommercialFilters() {
     if (commercialFiltersLoaded) return;
     try {
         const data = await fetchJSON('/api/commercial/filters', { key: 'cj-filters' });
-        fillFacet(cjClearance, data.clearances);
-        fillFacet(cjCountry, data.countries);
+        for (const facet of CJ_FACETS) buildFacetGroup(facet, data[facet.field]);
         commercialFiltersLoaded = true;
     } catch (err) {
         if (err.name === 'AbortError') return;
@@ -118,13 +128,47 @@ async function loadCommercialFilters() {
     }
 }
 
-function fillFacet(select, options) {
-    while (select.options.length > 1) select.remove(1);
+// Render one checkbox per facet value into the group body, all checked. Changes
+// apply immediately (no debounce) and reset to page 1.
+function buildFacetGroup(facet, options) {
+    const body = cjFacetBodies[facet.key];
+    body.innerHTML = '';
     for (const opt of options || []) {
-        const el = document.createElement('option');
-        el.value = opt.value;
-        el.textContent = `${opt.value} (${opt.count.toLocaleString()})`;
-        select.appendChild(el);
+        const label = document.createElement('label');
+        label.className = 'cj-facet-option';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = opt.value;
+        cb.checked = true;
+        cb.addEventListener('change', () => {
+            currentPage = 1;
+            loadList();
+        });
+        const text = document.createElement('span');
+        text.textContent = `${opt.value} (${opt.count.toLocaleString()})`;
+        label.append(cb, text);
+        body.appendChild(label);
+    }
+}
+
+function facetBoxes(key) {
+    return [...cjFacetBodies[key].querySelectorAll('input[type="checkbox"]')];
+}
+
+function setFacetGroup(key, checked) {
+    for (const cb of facetBoxes(key)) cb.checked = checked;
+    currentPage = 1;
+    loadList();
+}
+
+// "all | none" links per group live in the static HTML headers.
+for (const group of document.querySelectorAll('.cj-facet-group')) {
+    const key = group.dataset.facet;
+    for (const link of group.querySelectorAll('.cj-facet-actions a')) {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            setFacetGroup(key, link.dataset.action === 'all');
+        });
     }
 }
 
@@ -136,12 +180,10 @@ commercialSearch.addEventListener('input', () => {
     }, SEARCH_DEBOUNCE_MS);
 });
 
-for (const el of [cjClearance, cjCountry, cjExcludeNcr]) {
-    el.addEventListener('change', () => {
-        currentPage = 1;
-        loadList();
-    });
-}
+cjExcludeNcr.addEventListener('change', () => {
+    currentPage = 1;
+    loadList();
+});
 
 for (const input of [cjCompany, cjLocation, cjSalaryMin]) {
     input.addEventListener('input', () => {
@@ -154,13 +196,14 @@ for (const input of [cjCompany, cjLocation, cjSalaryMin]) {
 }
 
 cjClearBtn.addEventListener('click', () => {
-    cjClearance.value = '';
-    cjCountry.value = '';
     cjCompany.value = '';
     cjLocation.value = '';
     cjSalaryMin.value = '';
     cjExcludeNcr.checked = false;
     commercialSearch.value = '';
+    for (const facet of CJ_FACETS) {
+        for (const cb of facetBoxes(facet.key)) cb.checked = true;
+    }
     currentPage = 1;
     loadList();
 });
@@ -222,12 +265,25 @@ async function loadCommercial() {
     });
     const keyword = commercialSearch.value.trim();
     if (keyword) params.set('q', keyword);
-    if (cjClearance.value) params.set('clearance', cjClearance.value);
-    if (cjCountry.value) params.set('country', cjCountry.value);
     if (cjCompany.value.trim()) params.set('company', cjCompany.value.trim());
     if (cjLocation.value.trim()) params.set('location', cjLocation.value.trim());
     if (cjSalaryMin.value) params.set('salary_min', cjSalaryMin.value);
     if (cjExcludeNcr.checked) params.set('exclude_ncr', '1');
+
+    // Per group: all checked (or not yet loaded) omits the param; a subset appends
+    // one repeated param per checked value; none checked means "show nothing" —
+    // an omitted param would wrongly read as "all", so render the empty state.
+    for (const facet of CJ_FACETS) {
+        const boxes = facetBoxes(facet.key);
+        if (!boxes.length) continue;
+        const checked = boxes.filter((b) => b.checked);
+        if (checked.length === boxes.length) continue;
+        if (!checked.length) {
+            renderCommercial({ total: 0, jobs: [] });
+            return;
+        }
+        for (const b of checked) params.append(facet.param, b.value);
+    }
 
     listBody.innerHTML = '<div class="list-loading">Loading...</div>';
 

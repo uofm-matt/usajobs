@@ -77,11 +77,45 @@
             </div>
 
             <div id="commercial-filters" style="display:none">
-                <label for="cj-filter-clearance">Clearance</label>
-                <select id="cj-filter-clearance"><option value="">All clearances</option></select>
+                <div class="cj-facet-group" data-facet="clearance">
+                    <div class="cj-facet-head">
+                        <span>Clearance</span>
+                        <span class="cj-facet-actions">
+                            <a href="#" data-action="all">all</a><span class="cj-facet-sep">|</span><a href="#" data-action="none">none</a>
+                        </span>
+                    </div>
+                    <div class="cj-facet-body" id="cj-facet-clearance"></div>
+                </div>
 
-                <label for="cj-filter-country">Country</label>
-                <select id="cj-filter-country"><option value="">All countries</option></select>
+                <div class="cj-facet-group" data-facet="country">
+                    <div class="cj-facet-head">
+                        <span>Country</span>
+                        <span class="cj-facet-actions">
+                            <a href="#" data-action="all">all</a><span class="cj-facet-sep">|</span><a href="#" data-action="none">none</a>
+                        </span>
+                    </div>
+                    <div class="cj-facet-body" id="cj-facet-country"></div>
+                </div>
+
+                <div class="cj-facet-group" data-facet="industry">
+                    <div class="cj-facet-head">
+                        <span>Industry</span>
+                        <span class="cj-facet-actions">
+                            <a href="#" data-action="all">all</a><span class="cj-facet-sep">|</span><a href="#" data-action="none">none</a>
+                        </span>
+                    </div>
+                    <div class="cj-facet-body" id="cj-facet-industry"></div>
+                </div>
+
+                <div class="cj-facet-group" data-facet="employment_type">
+                    <div class="cj-facet-head">
+                        <span>Employment Type</span>
+                        <span class="cj-facet-actions">
+                            <a href="#" data-action="all">all</a><span class="cj-facet-sep">|</span><a href="#" data-action="none">none</a>
+                        </span>
+                    </div>
+                    <div class="cj-facet-body" id="cj-facet-employment_type"></div>
+                </div>
 
                 <label for="cj-filter-company">Company</label>
                 <input type="text" id="cj-filter-company" placeholder="e.g. Booz Allen">

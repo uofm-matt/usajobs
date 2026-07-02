@@ -39,9 +39,11 @@ class TestBuildWhere:
 
     def test_every_param_has_placeholder(self):
         where, params = _build_where(
-            clearance="Secret",
+            clearance=["Secret"],
             company="Acme Defense",
-            country="United States",
+            country=["United States"],
+            industry=["Aerospace"],
+            employment_type=["Full-time"],
             q="engineer",
             salary_min=90000,
         )
@@ -50,32 +52,75 @@ class TestBuildWhere:
 
     def test_no_user_values_in_sql(self):
         where, _ = _build_where(
-            clearance="Secret",
+            clearance=["Secret"],
             company="Acme Defense",
-            country="United States",
+            country=["United States"],
+            industry=["Aerospace"],
+            employment_type=["Full-time"],
             q="engineer",
             salary_min=90000,
         )
-        for literal in ("Secret", "Acme Defense", "United States", "engineer", "90000"):
+        for literal in (
+            "Secret",
+            "Acme Defense",
+            "United States",
+            "Aerospace",
+            "Full-time",
+            "engineer",
+            "90000",
+        ):
             assert literal not in where
 
-    def test_clearance_ilike(self):
-        where, params = _build_where(clearance="Secret")
-        assert "data->>'securityClearanceRequirement' ILIKE $1" in where
-        assert params == ["Secret"]
+    def test_clearance_multi_value_any(self):
+        # Multi-value: exact match against a single text[] param via = ANY.
+        where, params = _build_where(clearance=["Secret", "Top Secret"])
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in where
+        assert params == [["Secret", "Top Secret"]]
+
+    def test_clearance_single_element_list(self):
+        where, params = _build_where(clearance=["Secret"])
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in where
+        assert params == [["Secret"]]
 
     def test_company_wrapped_in_wildcards(self):
         where, params = _build_where(company="Valida")
         assert "data->'hiringOrganization'->>'name' ILIKE $1" in where
         assert params == ["%Valida%"]
 
-    def test_country_uses_lax_jsonpath(self):
-        where, params = _build_where(country="United States")
-        # Lax jsonpath + [*] handles jobLocation as a list or a single object.
-        assert "jsonb_path_exists(data" in where
-        assert "$.jobLocation[*].address.addressCountry ? (@ == $c)" in where
-        assert "jsonb_build_object('c', $1::text)" in where
-        assert params == ["United States"]
+    def test_country_multi_value_exists_over_normalized_locations(self):
+        where, params = _build_where(country=["United States", "Germany"])
+        # EXISTS over the normalized jobLocation array (list or single Place),
+        # matching addressCountry against the text[] param with = ANY.
+        assert "jsonb_typeof(data->'jobLocation') = 'array'" in where
+        assert "ELSE jsonb_build_array(data->'jobLocation') END" in where
+        assert "loc->'address'->>'addressCountry' = ANY($1)" in where
+        assert "jsonb_path_exists" not in where
+        assert params == [["United States", "Germany"]]
+
+    def test_industry_multi_value_any(self):
+        where, params = _build_where(industry=["Information Technology", "Aerospace"])
+        assert "data->>'industry' = ANY($1)" in where
+        assert params == [["Information Technology", "Aerospace"]]
+
+    def test_employment_type_multi_value_any(self):
+        where, params = _build_where(employment_type=["Full-time", "Contract"])
+        assert "data->>'employmentType' = ANY($1)" in where
+        assert params == [["Full-time", "Contract"]]
+
+    def test_four_facets_combine_with_coherent_numbering(self):
+        where, params = _build_where(
+            clearance=["Secret"],
+            country=["United States"],
+            industry=["Aerospace"],
+            employment_type=["Full-time"],
+        )
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in where
+        assert "loc->'address'->>'addressCountry' = ANY($2)" in where
+        assert "data->>'industry' = ANY($3)" in where
+        assert "data->>'employmentType' = ANY($4)" in where
+        assert params == [["Secret"], ["United States"], ["Aerospace"], ["Full-time"]]
+        for i in range(1, len(params) + 1):
+            assert f"${i}" in where, f"missing placeholder ${i}"
 
     def test_keyword_matches_title_or_slug_with_one_param(self):
         where, params = _build_where(q="analyst")
@@ -97,8 +142,8 @@ class TestBuildWhere:
         assert params == [0]
 
     def test_placeholders_sequential_across_filters(self):
-        where, params = _build_where(clearance="Secret", company="X", q="y")
-        assert "ILIKE $1" in where  # clearance
+        where, params = _build_where(clearance=["Secret"], company="X", q="y")
+        assert "= ANY($1)" in where  # clearance
         assert "$2" in where  # company
         assert "$3" in where  # keyword (title + slug)
         assert len(params) == 3
@@ -118,13 +163,13 @@ class TestBuildWhere:
 
     def test_location_placeholder_sequential_after_other_filters(self):
         where, params = _build_where(
-            clearance="Secret", company="X", q="y", location="Denver"
+            clearance=["Secret"], company="X", q="y", location="Denver"
         )
-        assert "ILIKE $1" in where  # clearance
+        assert "= ANY($1)" in where  # clearance
         assert "$2" in where  # company
         assert "$3" in where  # keyword (title + slug)
         assert "ILIKE $4" in where  # location locality + region
-        assert params == ["Secret", "%X%", "%y%", "%Denver%"]
+        assert params == [["Secret"], "%X%", "%y%", "%Denver%"]
         for i in range(1, len(params) + 1):
             assert f"${i}" in where, f"missing placeholder ${i}"
 
@@ -152,14 +197,18 @@ class TestBuildWhere:
 
     def test_exclude_ncr_placeholder_sequential_after_other_filters(self):
         where, params = _build_where(
-            clearance="Secret", company="X", q="y", location="Denver", exclude_ncr=True
+            clearance=["Secret"],
+            company="X",
+            q="y",
+            location="Denver",
+            exclude_ncr=True,
         )
-        assert "ILIKE $1" in where  # clearance
+        assert "= ANY($1)" in where  # clearance
         assert "$2" in where  # company
         assert "$3" in where  # keyword (title + slug)
         assert "ILIKE $4" in where  # location locality + region
         assert "= ANY($5)" in where  # NCR city list
-        assert params == ["Secret", "%X%", "%y%", "%Denver%", NCR_CITIES]
+        assert params == [["Secret"], "%X%", "%y%", "%Denver%", NCR_CITIES]
         for i in range(1, len(params) + 1):
             assert f"${i}" in where, f"missing placeholder ${i}"
 
@@ -369,12 +418,72 @@ class TestEndpoint:
         assert "CASE WHEN" in sql and "baseSalary" in sql
         assert conn.fetch.call_args.args[1:] == (90000,)
 
-    async def test_country_filter_uses_jsonpath(self, client):
+    async def test_clearance_multi_value_binds_one_list_param(self, client):
         ac, conn = client
-        await ac.get("/api/commercial/jobs", params={"country": "United States"})
+        await ac.get(
+            "/api/commercial/jobs", params={"clearance": ["Secret", "Top Secret"]}
+        )
         sql = conn.fetch.call_args.args[0]
-        assert "jsonb_path_exists(data" in sql
-        assert conn.fetch.call_args.args[1:] == ("United States",)
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in sql
+        # Repeated query params arrive as one text[] param on both queries.
+        assert conn.fetchval.call_args.args[1:] == (["Secret", "Top Secret"],)
+        assert conn.fetch.call_args.args[1:] == (["Secret", "Top Secret"],)
+
+    async def test_clearance_single_element_list(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"clearance": "Secret"})
+        assert "= ANY($1)" in conn.fetch.call_args.args[0]
+        assert conn.fetch.call_args.args[1:] == (["Secret"],)
+
+    async def test_country_multi_value_uses_exists_normalization(self, client):
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/jobs", params={"country": ["United States", "Germany"]}
+        )
+        sql = conn.fetch.call_args.args[0]
+        assert "jsonb_path_exists" not in sql
+        assert "jsonb_array_elements" in sql
+        assert "ELSE jsonb_build_array(data->'jobLocation') END" in sql
+        assert "loc->'address'->>'addressCountry' = ANY($1)" in sql
+        assert conn.fetch.call_args.args[1:] == (["United States", "Germany"],)
+
+    async def test_industry_multi_value_binds_one_list_param(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"industry": ["Aerospace", "IT"]})
+        assert "data->>'industry' = ANY($1)" in conn.fetch.call_args.args[0]
+        assert conn.fetch.call_args.args[1:] == (["Aerospace", "IT"],)
+
+    async def test_employment_type_multi_value_binds_one_list_param(self, client):
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/jobs",
+            params={"employment_type": ["Full-time", "Contract"]},
+        )
+        assert "data->>'employmentType' = ANY($1)" in conn.fetch.call_args.args[0]
+        assert conn.fetch.call_args.args[1:] == (["Full-time", "Contract"],)
+
+    async def test_multiple_facet_categories_combine_coherent_numbering(self, client):
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/jobs",
+            params={
+                "clearance": "Secret",
+                "country": "United States",
+                "industry": "Aerospace",
+                "employment_type": "Full-time",
+            },
+        )
+        sql = conn.fetch.call_args.args[0]
+        assert "data->>'securityClearanceRequirement' = ANY($1)" in sql
+        assert "loc->'address'->>'addressCountry' = ANY($2)" in sql
+        assert "data->>'industry' = ANY($3)" in sql
+        assert "data->>'employmentType' = ANY($4)" in sql
+        assert conn.fetch.call_args.args[1:] == (
+            ["Secret"],
+            ["United States"],
+            ["Aerospace"],
+            ["Full-time"],
+        )
 
     async def test_location_filter_binds_wildcarded_param(self, client):
         ac, conn = client
@@ -482,6 +591,8 @@ class TestFiltersEndpoint:
         conn.fetch.side_effect = [
             [{"value": "Secret", "c": 12}, {"value": "Top Secret", "c": 3}],
             [{"value": "United States", "c": 40}, {"value": "Germany", "c": 2}],
+            [{"value": "Aerospace", "c": 30}, {"value": "IT", "c": 9}],
+            [{"value": "Full-time", "c": 50}, {"value": "Contract", "c": 4}],
         ]
         r = await ac.get("/api/commercial/filters")
         assert r.status_code == 200
@@ -494,16 +605,28 @@ class TestFiltersEndpoint:
                 {"value": "United States", "count": 40},
                 {"value": "Germany", "count": 2},
             ],
+            "industries": [
+                {"value": "Aerospace", "count": 30},
+                {"value": "IT", "count": 9},
+            ],
+            "employment_types": [
+                {"value": "Full-time", "count": 50},
+                {"value": "Contract", "count": 4},
+            ],
         }
 
     async def test_sql_targets_active_predicate(self, client):
         ac, conn = client
         await ac.get("/api/commercial/filters")
-        clearance_sql, country_sql = (c.args[0] for c in conn.fetch.call_args_list)
-        assert ACTIVE in clearance_sql
-        assert ACTIVE in country_sql
+        clearance_sql, country_sql, industry_sql, employment_sql = (
+            c.args[0] for c in conn.fetch.call_args_list
+        )
+        for sql in (clearance_sql, country_sql, industry_sql, employment_sql):
+            assert ACTIVE in sql
         assert "securityClearanceRequirement" in clearance_sql
         # Country facet normalizes list/single-object jobLocation like the filter.
         assert "addressCountry" in country_sql
         assert "jsonb_array_elements" in country_sql
         assert "ELSE jsonb_build_array(data->'jobLocation') END" in country_sql
+        assert "data->>'industry'" in industry_sql
+        assert "data->>'employmentType'" in employment_sql
