@@ -12,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock
 
 from backend.api.commercial import (
+    NCR_CITIES,
     _build_where,
     _item,
     _locations,
@@ -126,6 +127,45 @@ class TestBuildWhere:
         assert params == ["Secret", "%X%", "%y%", "%Denver%"]
         for i in range(1, len(params) + 1):
             assert f"${i}" in where, f"missing placeholder ${i}"
+
+    def test_exclude_ncr_off_by_default_leaves_sql_unchanged(self):
+        # Default (unchecked) must not touch the base predicate or bind a param.
+        where, params = _build_where()
+        assert where == " AND ".join(BASE)
+        assert params == []
+        assert "= ANY(" not in where
+
+    def test_exclude_ncr_keeps_jobs_with_any_non_ncr_location(self):
+        where, params = _build_where(exclude_ncr=True)
+        # Keep a job unless EVERY location is NCR: EXISTS a location that is NOT
+        # (DC, or a VA/MD locality in the city list).
+        assert "jsonb_typeof(data->'jobLocation') = 'array'" in where
+        assert "ELSE jsonb_build_array(data->'jobLocation') END" in where
+        assert "WHERE NOT (" in where
+        assert "COALESCE(loc->'address'->>'addressRegion', '') = 'DC'" in where
+        assert "IN ('VA', 'MD')" in where
+        # Single bound param carrying the whole city list, matched with = ANY.
+        assert (
+            "lower(COALESCE(loc->'address'->>'addressLocality', '')) = ANY($1)" in where
+        )
+        assert params == [NCR_CITIES]
+
+    def test_exclude_ncr_placeholder_sequential_after_other_filters(self):
+        where, params = _build_where(
+            clearance="Secret", company="X", q="y", location="Denver", exclude_ncr=True
+        )
+        assert "ILIKE $1" in where  # clearance
+        assert "$2" in where  # company
+        assert "$3" in where  # keyword (title + slug)
+        assert "ILIKE $4" in where  # location locality + region
+        assert "= ANY($5)" in where  # NCR city list
+        assert params == ["Secret", "%X%", "%y%", "%Denver%", NCR_CITIES]
+        for i in range(1, len(params) + 1):
+            assert f"${i}" in where, f"missing placeholder ${i}"
+
+    def test_exclude_ncr_city_list_is_lowercase(self):
+        # The predicate compares lower(locality); the list must already be lowercase.
+        assert NCR_CITIES == [c.lower() for c in NCR_CITIES]
 
 
 # --- Item shaping ---
@@ -344,6 +384,24 @@ class TestEndpoint:
         assert "ELSE jsonb_build_array(data->'jobLocation') END" in sql
         assert "ILIKE $1" in sql
         assert conn.fetch.call_args.args[1:] == ("%Denver%",)
+
+    async def test_exclude_ncr_binds_city_list_param(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"exclude_ncr": 1})
+        sql = conn.fetch.call_args.args[0]
+        assert "WHERE NOT (" in sql
+        assert "IN ('VA', 'MD')" in sql
+        assert "= ANY($1)" in sql
+        # One param: the city list, bound to both the count and list queries.
+        assert conn.fetchval.call_args.args[1:] == (NCR_CITIES,)
+        assert conn.fetch.call_args.args[1:] == (NCR_CITIES,)
+
+    async def test_exclude_ncr_absent_leaves_no_ncr_clause(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs")
+        sql = conn.fetch.call_args.args[0]
+        assert "IN ('VA', 'MD')" not in sql
+        assert conn.fetch.call_args.args[1:] == ()
 
     async def test_limit_over_cap_rejected(self, client):
         ac, _ = client

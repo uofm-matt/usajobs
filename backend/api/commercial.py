@@ -37,6 +37,81 @@ _JOB_LOCATIONS = (
     "ELSE jsonb_build_array(data->'jobLocation') END"
 )
 
+# Practical "DC commute" definition for exclude_ncr: the National Capital Region
+# proper plus the Fort Meade corridor (BW Parkway / Anne Arundel). Lowercased to
+# match against lower(addressLocality). VA/MD only — DC itself is caught by region.
+# Tunable: add/remove suburbs here without touching the query.
+NCR_CITIES = [
+    # Northern Virginia
+    "arlington",
+    "alexandria",
+    "falls church",
+    "fairfax",
+    "mclean",
+    "tysons",
+    "tysons corner",
+    "vienna",
+    "oakton",
+    "merrifield",
+    "reston",
+    "herndon",
+    "chantilly",
+    "centreville",
+    "springfield",
+    "annandale",
+    "burke",
+    "ashburn",
+    "sterling",
+    "dulles",
+    "leesburg",
+    "manassas",
+    "manassas park",
+    "gainesville",
+    "haymarket",
+    "woodbridge",
+    "lorton",
+    "dumfries",
+    "fort belvoir",
+    "ft. belvoir",
+    "quantico",
+    "stafford",
+    # Suburban Maryland + Fort Meade corridor
+    "bethesda",
+    "chevy chase",
+    "rockville",
+    "gaithersburg",
+    "germantown",
+    "silver spring",
+    "wheaton",
+    "college park",
+    "greenbelt",
+    "beltsville",
+    "adelphi",
+    "laurel",
+    "columbia",
+    "fort meade",
+    "ft. meade",
+    "ft meade",
+    "annapolis junction",
+    "hanover",
+    "jessup",
+    "odenton",
+    "severn",
+    "linthicum",
+    "linthicum heights",
+    "elkridge",
+    "lanham",
+    "hyattsville",
+    "landover",
+    "largo",
+    "upper marlboro",
+    "bowie",
+    "suitland",
+    "camp springs",
+    "andrews afb",
+    "joint base andrews",
+]
+
 
 def _sort_exprs(d: str) -> dict[str, str]:
     """Whitelisted ORDER BY expressions over the JobPosting jsonb at column `d`.
@@ -61,7 +136,13 @@ def _sort_exprs(d: str) -> dict[str, str]:
 
 
 def _build_where(
-    clearance=None, company=None, country=None, q=None, salary_min=None, location=None
+    clearance=None,
+    company=None,
+    country=None,
+    q=None,
+    salary_min=None,
+    location=None,
+    exclude_ncr=False,
 ) -> tuple[str, list]:
     """WHERE clause + $N-bound params for active CJ postings with detail data.
 
@@ -102,6 +183,23 @@ def _build_where(
             f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
             f"WHERE loc->'address'->>'addressLocality' ILIKE ${n} "
             f"OR loc->'address'->>'addressRegion' ILIKE ${n})"
+        )
+    if exclude_ncr:
+        params.append(NCR_CITIES)
+        n = len(params)
+        # Keep a job unless *every* location is NCR: EXISTS a location that is NOT
+        # NCR. The COALESCEs are load-bearing — a location with null region/city
+        # coalesces to '' (non-NCR), so it satisfies the NOT and keeps the job
+        # rather than dropping out of the predicate via NULL. A missing jobLocation
+        # normalizes to [null] (see _JOB_LOCATIONS): its lone element's
+        # loc->'address' is NULL → coalesced to '' → non-NCR → job kept.
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
+            "WHERE NOT ("
+            "COALESCE(loc->'address'->>'addressRegion', '') = 'DC' "
+            "OR (COALESCE(loc->'address'->>'addressRegion', '') IN ('VA', 'MD') "
+            f"AND lower(COALESCE(loc->'address'->>'addressLocality', '')) = ANY(${n})"
+            ")))"
         )
 
     return " AND ".join(clauses), params
@@ -165,6 +263,7 @@ async def get_commercial_jobs(
     q: Annotated[str | None, Query()] = None,
     salary_min: Annotated[int | None, Query(ge=0)] = None,
     location: Annotated[str | None, Query()] = None,
+    exclude_ncr: Annotated[bool, Query()] = False,
     sort: Annotated[str, Query()] = "posted",
     order: Annotated[str, Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
@@ -188,6 +287,7 @@ async def get_commercial_jobs(
         q=q,
         salary_min=salary_min,
         location=location,
+        exclude_ncr=exclude_ncr,
     )
 
     pool = get_pool()

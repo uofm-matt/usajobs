@@ -25,6 +25,7 @@ const cjCountry = document.getElementById('cj-filter-country');
 const cjCompany = document.getElementById('cj-filter-company');
 const cjLocation = document.getElementById('cj-filter-location');
 const cjSalaryMin = document.getElementById('cj-filter-salary-min');
+const cjExcludeNcr = document.getElementById('cj-filter-exclude-ncr');
 const cjClearBtn = document.getElementById('cj-filter-clear');
 const COMMERCIAL_PER_PAGE = 25;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -135,8 +136,8 @@ commercialSearch.addEventListener('input', () => {
     }, SEARCH_DEBOUNCE_MS);
 });
 
-for (const sel of [cjClearance, cjCountry]) {
-    sel.addEventListener('change', () => {
+for (const el of [cjClearance, cjCountry, cjExcludeNcr]) {
+    el.addEventListener('change', () => {
         currentPage = 1;
         loadList();
     });
@@ -158,6 +159,7 @@ cjClearBtn.addEventListener('click', () => {
     cjCompany.value = '';
     cjLocation.value = '';
     cjSalaryMin.value = '';
+    cjExcludeNcr.checked = false;
     commercialSearch.value = '';
     currentPage = 1;
     loadList();
@@ -225,6 +227,7 @@ async function loadCommercial() {
     if (cjCompany.value.trim()) params.set('company', cjCompany.value.trim());
     if (cjLocation.value.trim()) params.set('location', cjLocation.value.trim());
     if (cjSalaryMin.value) params.set('salary_min', cjSalaryMin.value);
+    if (cjExcludeNcr.checked) params.set('exclude_ncr', '1');
 
     listBody.innerHTML = '<div class="list-loading">Loading...</div>';
 
