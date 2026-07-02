@@ -7,7 +7,7 @@ since CJ's validThrough is unreliable (evergreen 2016 postings still list).
 import json
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -24,6 +24,30 @@ _SALARY_MIN = "data->'baseSalary'->'value'->>'minValue'"
 _SALARY_MAX = "data->'baseSalary'->'value'->>'maxValue'"
 _SALARY_TEXT = f"COALESCE({_SALARY_MIN}, {_SALARY_MAX})"
 _NUMERIC = r"^[0-9]+(\.[0-9]+)?$"
+
+_SORT_ORDERS = ("asc", "desc")
+
+
+def _sort_exprs(d: str) -> dict[str, str]:
+    """Whitelisted ORDER BY expressions over the JobPosting jsonb at column `d`.
+
+    `d` is always a server-side literal ("data" for the inner page CTE, "j.data"
+    for the outer join) — never user input. Salary sorts numerically via the same
+    guarded CASE the salary_min filter uses; absent/non-numeric values fall to NULL.
+    """
+    salary = f"COALESCE({d}->'baseSalary'->'value'->>'minValue', {d}->'baseSalary'->'value'->>'maxValue')"
+    return {
+        "posted": f"{d}->>'datePosted'",
+        "close": f"{d}->>'validThrough'",
+        "salary": f"CASE WHEN {salary} ~ '{_NUMERIC}' THEN ({salary})::numeric END",
+        "title": f"{d}->>'title'",
+        "company": f"{d}->'hiringOrganization'->>'name'",
+        "clearance": f"{d}->>'securityClearanceRequirement'",
+        "location": (
+            f"COALESCE({d}->'jobLocation'->0->'address'->>'addressLocality', "
+            f"{d}->'jobLocation'->'address'->>'addressLocality')"
+        ),
+    }
 
 
 def _build_where(
@@ -126,9 +150,22 @@ async def get_commercial_jobs(
     country: Annotated[str | None, Query()] = None,
     q: Annotated[str | None, Query()] = None,
     salary_min: Annotated[int | None, Query(ge=0)] = None,
+    sort: Annotated[str, Query()] = "posted",
+    order: Annotated[str, Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
+    inner_exprs = _sort_exprs("data")
+    if sort not in inner_exprs or order not in _SORT_ORDERS:
+        return Response(
+            content=json.dumps({"error": "invalid sort or order", "code": 422}),
+            status_code=422,
+            media_type="application/json",
+        )
+    direction = "DESC" if order == "desc" else "ASC"
+    inner_order = f"{inner_exprs[sort]} {direction} NULLS LAST, ext_id"
+    outer_order = f"{_sort_exprs('j.data')[sort]} {direction} NULLS LAST, j.ext_id"
+
     where, params = _build_where(
         clearance=clearance,
         company=company,
@@ -148,7 +185,7 @@ async def get_commercial_jobs(
                 SELECT source, ext_id
                 FROM commercial.jobs_raw
                 WHERE {where}
-                ORDER BY data->>'datePosted' DESC NULLS LAST, ext_id
+                ORDER BY {inner_order}
                 LIMIT {limit} OFFSET {offset}
             )
             SELECT
@@ -165,7 +202,7 @@ async def get_commercial_jobs(
                 j.{_SALARY_MAX} AS salary_max
             FROM page
             JOIN commercial.jobs_raw j USING (source, ext_id)
-            ORDER BY j.data->>'datePosted' DESC NULLS LAST, j.ext_id
+            ORDER BY {outer_order}
             """,
             *params,
         )

@@ -6,11 +6,18 @@ route through the ASGI app with the asyncpg pool replaced by an AsyncMock.
 
 import json
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock
 
-from backend.api.commercial import _build_where, _item, _locations, _num
+from backend.api.commercial import (
+    _build_where,
+    _item,
+    _locations,
+    _num,
+    _sort_exprs,
+)
 from backend.main import app
 
 BASE = [
@@ -308,3 +315,65 @@ class TestEndpoint:
         ac, _ = client
         r = await ac.get("/api/commercial/jobs", params={"limit": 101})
         assert r.status_code == 422
+
+
+# --- Sorting ---
+
+SORT_FIELDS = ["posted", "close", "salary", "title", "company", "clearance", "location"]
+
+
+class TestSort:
+    @pytest.mark.parametrize("field", SORT_FIELDS)
+    @pytest.mark.parametrize("order,direction", [("asc", "ASC"), ("desc", "DESC")])
+    async def test_expression_in_both_order_bys(self, client, field, order, direction):
+        # The chosen expression must appear in the inner page CTE (unqualified) and
+        # the outer join (j. qualified), with the direction, NULLS LAST, and the
+        # ext_id tiebreaker in each.
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"sort": field, "order": order})
+        sql = conn.fetch.call_args.args[0]
+        inner = f"ORDER BY {_sort_exprs('data')[field]} {direction} NULLS LAST, ext_id"
+        outer = (
+            f"ORDER BY {_sort_exprs('j.data')[field]} {direction} NULLS LAST, j.ext_id"
+        )
+        assert inner in sql
+        assert outer in sql
+
+    async def test_salary_sorts_numerically_not_text(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"sort": "salary"})
+        sql = conn.fetch.call_args.args[0]
+        assert "CASE WHEN" in sql
+        assert "baseSalary" in sql
+        assert "::numeric END DESC" in sql
+
+    async def test_nulls_last_in_both_clauses_regardless_of_direction(self, client):
+        ac, conn = client
+        for order in ("asc", "desc"):
+            await ac.get(
+                "/api/commercial/jobs", params={"sort": "close", "order": order}
+            )
+            sql = conn.fetch.call_args.args[0]
+            assert sql.count("NULLS LAST") == 2
+
+    async def test_default_is_posted_desc(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs")
+        sql = conn.fetch.call_args.args[0]
+        assert "ORDER BY data->>'datePosted' DESC NULLS LAST, ext_id" in sql
+        assert "ORDER BY j.data->>'datePosted' DESC NULLS LAST, j.ext_id" in sql
+
+    async def test_invalid_sort_rejected(self, client):
+        ac, _ = client
+        r = await ac.get("/api/commercial/jobs", params={"sort": "bogus"})
+        assert r.status_code == 422
+
+    async def test_invalid_order_rejected(self, client):
+        ac, _ = client
+        r = await ac.get("/api/commercial/jobs", params={"order": "sideways"})
+        assert r.status_code == 422
+
+    async def test_invalid_sort_never_reaches_the_database(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"sort": "ext_id; DROP TABLE x"})
+        conn.fetch.assert_not_called()

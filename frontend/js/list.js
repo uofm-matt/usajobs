@@ -16,12 +16,23 @@ const listBtn = document.getElementById('view-list');
 const sortField = document.getElementById('list-sort-field');
 const sortOrderBtn = document.getElementById('list-sort-order');
 const filterPanel = document.getElementById('filter-panel');
-const listSort = document.getElementById('list-sort');
 const federalBtn = document.getElementById('source-federal');
 const commercialBtn = document.getElementById('source-commercial');
 const commercialSearch = document.getElementById('commercial-search');
 const COMMERCIAL_PER_PAGE = 25;
 const SEARCH_DEBOUNCE_MS = 300;
+
+// Federal options come from the HTML; commercial swaps in its own set on source
+// change. Keep the original markup and prior selection to restore on switch back.
+const FEDERAL_SORT_OPTIONS = sortField.innerHTML;
+const COMMERCIAL_SORT_OPTIONS = `
+    <option value="posted" selected>Posted</option>
+    <option value="close">Close Date</option>
+    <option value="salary">Salary</option>
+    <option value="title">Title</option>
+    <option value="company">Company</option>
+    <option value="clearance">Clearance</option>
+    <option value="location">Location</option>`;
 
 let currentPage = 1;
 let sortOrder = 'desc';
@@ -29,6 +40,7 @@ let active = false;
 let mapBbox = null;
 let source = 'federal';
 let searchTimer = null;
+let federalSortValue = sortField.value;
 
 // Toggle between views
 mapBtn.addEventListener('click', () => {
@@ -57,8 +69,8 @@ listBtn.addEventListener('click', () => {
 federalBtn.addEventListener('click', () => setSource('federal'));
 commercialBtn.addEventListener('click', () => setSource('commercial'));
 
-// Commercial (ClearanceJobs) is a list-only source: only the free-text search
-// applies, so the federal filters and sort controls are dimmed/hidden.
+// Commercial (ClearanceJobs) is a list-only source: the federal map filters are
+// dimmed, but sorting stays available with a commercial-specific option set.
 function setSource(next) {
     if (source === next) return;
     source = next;
@@ -66,8 +78,14 @@ function setSource(next) {
     federalBtn.classList.toggle('active', !commercial);
     commercialBtn.classList.toggle('active', commercial);
     filterPanel.classList.toggle('source-disabled', commercial);
-    listSort.style.display = commercial ? 'none' : '';
     commercialSearch.style.display = commercial ? '' : 'none';
+    if (commercial) {
+        federalSortValue = sortField.value;
+        sortField.innerHTML = COMMERCIAL_SORT_OPTIONS;
+    } else {
+        sortField.innerHTML = FEDERAL_SORT_OPTIONS;
+        sortField.value = federalSortValue;
+    }
     currentPage = 1;
     loadList();
 }
@@ -132,6 +150,8 @@ async function loadCommercial() {
     const params = new URLSearchParams({
         limit: COMMERCIAL_PER_PAGE,
         offset: (currentPage - 1) * COMMERCIAL_PER_PAGE,
+        sort: sortField.value,
+        order: sortOrder,
     });
     const keyword = commercialSearch.value.trim();
     if (keyword) params.set('q', keyword);
