@@ -27,6 +27,16 @@ _NUMERIC = r"^[0-9]+(\.[0-9]+)?$"
 
 _SORT_ORDERS = ("asc", "desc")
 
+_ACTIVE = "source = 'clearancejobs' AND data IS NOT NULL AND consecutive_misses = 0"
+
+# jobLocation is usually a list of Places but can be a single Place object;
+# normalize both to a jsonb array so jsonb_array_elements can unnest it.
+_JOB_LOCATIONS = (
+    "CASE WHEN jsonb_typeof(data->'jobLocation') = 'array' "
+    "THEN data->'jobLocation' "
+    "ELSE jsonb_build_array(data->'jobLocation') END"
+)
+
 
 def _sort_exprs(d: str) -> dict[str, str]:
     """Whitelisted ORDER BY expressions over the JobPosting jsonb at column `d`.
@@ -51,7 +61,7 @@ def _sort_exprs(d: str) -> dict[str, str]:
 
 
 def _build_where(
-    clearance=None, company=None, country=None, q=None, salary_min=None
+    clearance=None, company=None, country=None, q=None, salary_min=None, location=None
 ) -> tuple[str, list]:
     """WHERE clause + $N-bound params for active CJ postings with detail data.
 
@@ -59,11 +69,7 @@ def _build_where(
     surfaced only once its detail page is fetched (data IS NOT NULL) and it is
     still present in the latest sitemap sweep (consecutive_misses = 0).
     """
-    clauses = [
-        "source = 'clearancejobs'",
-        "data IS NOT NULL",
-        "consecutive_misses = 0",
-    ]
+    clauses = [_ACTIVE]
     params: list = []
 
     if clearance:
@@ -88,6 +94,14 @@ def _build_where(
         clauses.append(
             f"CASE WHEN {_SALARY_TEXT} ~ '{_NUMERIC}' "
             f"THEN ({_SALARY_TEXT})::numeric END >= ${len(params)}"
+        )
+    if location:
+        params.append(f"%{location}%")
+        n = len(params)
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
+            f"WHERE loc->'address'->>'addressLocality' ILIKE ${n} "
+            f"OR loc->'address'->>'addressRegion' ILIKE ${n})"
         )
 
     return " AND ".join(clauses), params
@@ -150,6 +164,7 @@ async def get_commercial_jobs(
     country: Annotated[str | None, Query()] = None,
     q: Annotated[str | None, Query()] = None,
     salary_min: Annotated[int | None, Query(ge=0)] = None,
+    location: Annotated[str | None, Query()] = None,
     sort: Annotated[str, Query()] = "posted",
     order: Annotated[str, Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
@@ -172,6 +187,7 @@ async def get_commercial_jobs(
         country=country,
         q=q,
         salary_min=salary_min,
+        location=location,
     )
 
     pool = get_pool()
@@ -212,4 +228,33 @@ async def get_commercial_jobs(
         "limit": limit,
         "offset": offset,
         "jobs": [_item(r) for r in rows],
+    }
+
+
+@router.get("/api/commercial/filters")
+@limiter.limit("120/minute")
+async def get_commercial_filters(request: Request):
+    """Facet options (clearance, country) over the active CJ posting set.
+
+    Country counts are per-job: a posting with several locations in one country
+    counts once, matching how the country filter surfaces a job on any match.
+    """
+    pool = get_pool()
+    async with pool.acquire(timeout=5) as conn:
+        clearances = await conn.fetch(
+            "SELECT data->>'securityClearanceRequirement' AS value, COUNT(*) AS c "
+            f"FROM commercial.jobs_raw WHERE {_ACTIVE} "
+            "AND data->>'securityClearanceRequirement' IS NOT NULL "
+            "GROUP BY value ORDER BY c DESC, value"
+        )
+        countries = await conn.fetch(
+            "SELECT value, COUNT(*) AS c FROM ("
+            "SELECT DISTINCT ext_id, loc->'address'->>'addressCountry' AS value "
+            f"FROM commercial.jobs_raw, jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
+            f"WHERE {_ACTIVE}) sub "
+            "WHERE value IS NOT NULL GROUP BY value ORDER BY c DESC, value"
+        )
+    return {
+        "clearances": [{"value": r["value"], "count": r["c"]} for r in clearances],
+        "countries": [{"value": r["value"], "count": r["c"]} for r in countries],
     }

@@ -22,6 +22,7 @@
             <button id="filter-toggle" title="Collapse filters">&lsaquo;</button>
         </div>
         <div class="filter-body">
+            <div id="federal-filters">
             <label for="filter-keyword">Keyword</label>
             <input type="text" id="filter-keyword" placeholder="e.g. IT Specialist">
 
@@ -73,6 +74,26 @@
             </div>
 
             <button id="filter-clear" class="filter-clear-btn">Clear all</button>
+            </div>
+
+            <div id="commercial-filters" style="display:none">
+                <label for="cj-filter-clearance">Clearance</label>
+                <select id="cj-filter-clearance"><option value="">All clearances</option></select>
+
+                <label for="cj-filter-country">Country</label>
+                <select id="cj-filter-country"><option value="">All countries</option></select>
+
+                <label for="cj-filter-company">Company</label>
+                <input type="text" id="cj-filter-company" placeholder="e.g. Booz Allen">
+
+                <label for="cj-filter-location">Location</label>
+                <input type="text" id="cj-filter-location" placeholder="City or state">
+
+                <label for="cj-filter-salary-min">Salary floor ($)</label>
+                <input type="number" id="cj-filter-salary-min" min="0" step="1000" placeholder="Min">
+
+                <button id="cj-filter-clear" class="filter-clear-btn">Clear all</button>
+            </div>
         </div>
     </div>
 

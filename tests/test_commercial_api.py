@@ -102,6 +102,31 @@ class TestBuildWhere:
         assert "$3" in where  # keyword (title + slug)
         assert len(params) == 3
 
+    def test_location_normalizes_both_joblocation_shapes(self):
+        where, params = _build_where(location="Denver")
+        # One CASE handles jobLocation as a list or a single Place object, so the
+        # same clause matches whichever shape the row stores.
+        assert "jsonb_typeof(data->'jobLocation') = 'array'" in where
+        assert "THEN data->'jobLocation'" in where
+        assert "ELSE jsonb_build_array(data->'jobLocation') END" in where
+        # Parameterized ILIKE against locality OR region — no like_regex on input.
+        assert "loc->'address'->>'addressLocality' ILIKE $1" in where
+        assert "loc->'address'->>'addressRegion' ILIKE $1" in where
+        assert "like_regex" not in where
+        assert params == ["%Denver%"]
+
+    def test_location_placeholder_sequential_after_other_filters(self):
+        where, params = _build_where(
+            clearance="Secret", company="X", q="y", location="Denver"
+        )
+        assert "ILIKE $1" in where  # clearance
+        assert "$2" in where  # company
+        assert "$3" in where  # keyword (title + slug)
+        assert "ILIKE $4" in where  # location locality + region
+        assert params == ["Secret", "%X%", "%y%", "%Denver%"]
+        for i in range(1, len(params) + 1):
+            assert f"${i}" in where, f"missing placeholder ${i}"
+
 
 # --- Item shaping ---
 
@@ -311,6 +336,15 @@ class TestEndpoint:
         assert "jsonb_path_exists(data" in sql
         assert conn.fetch.call_args.args[1:] == ("United States",)
 
+    async def test_location_filter_binds_wildcarded_param(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/jobs", params={"location": "Denver"})
+        sql = conn.fetch.call_args.args[0]
+        assert "jsonb_array_elements" in sql
+        assert "ELSE jsonb_build_array(data->'jobLocation') END" in sql
+        assert "ILIKE $1" in sql
+        assert conn.fetch.call_args.args[1:] == ("%Denver%",)
+
     async def test_limit_over_cap_rejected(self, client):
         ac, _ = client
         r = await ac.get("/api/commercial/jobs", params={"limit": 101})
@@ -377,3 +411,41 @@ class TestSort:
         ac, conn = client
         await ac.get("/api/commercial/jobs", params={"sort": "ext_id; DROP TABLE x"})
         conn.fetch.assert_not_called()
+
+
+# --- Facet options ---
+
+ACTIVE = "source = 'clearancejobs' AND data IS NOT NULL AND consecutive_misses = 0"
+
+
+class TestFiltersEndpoint:
+    async def test_documented_shape(self, client):
+        ac, conn = client
+        conn.fetch.side_effect = [
+            [{"value": "Secret", "c": 12}, {"value": "Top Secret", "c": 3}],
+            [{"value": "United States", "c": 40}, {"value": "Germany", "c": 2}],
+        ]
+        r = await ac.get("/api/commercial/filters")
+        assert r.status_code == 200
+        assert r.json() == {
+            "clearances": [
+                {"value": "Secret", "count": 12},
+                {"value": "Top Secret", "count": 3},
+            ],
+            "countries": [
+                {"value": "United States", "count": 40},
+                {"value": "Germany", "count": 2},
+            ],
+        }
+
+    async def test_sql_targets_active_predicate(self, client):
+        ac, conn = client
+        await ac.get("/api/commercial/filters")
+        clearance_sql, country_sql = (c.args[0] for c in conn.fetch.call_args_list)
+        assert ACTIVE in clearance_sql
+        assert ACTIVE in country_sql
+        assert "securityClearanceRequirement" in clearance_sql
+        # Country facet normalizes list/single-object jobLocation like the filter.
+        assert "addressCountry" in country_sql
+        assert "jsonb_array_elements" in country_sql
+        assert "ELSE jsonb_build_array(data->'jobLocation') END" in country_sql

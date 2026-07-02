@@ -493,12 +493,6 @@ html, body {
     box-shadow: 0 0 0 2px rgba(21, 101, 192, 0.15);
 }
 
-/* Federal filters don't apply to commercial listings — dim them out */
-#filter-panel.source-disabled .filter-body {
-    opacity: 0.4;
-    pointer-events: none;
-}
-
 #list-count {
     font-size: 14px;
     font-weight: 600;

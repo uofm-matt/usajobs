@@ -15,10 +15,17 @@ const mapBtn = document.getElementById('view-map');
 const listBtn = document.getElementById('view-list');
 const sortField = document.getElementById('list-sort-field');
 const sortOrderBtn = document.getElementById('list-sort-order');
-const filterPanel = document.getElementById('filter-panel');
+const federalFilters = document.getElementById('federal-filters');
+const commercialFilters = document.getElementById('commercial-filters');
 const federalBtn = document.getElementById('source-federal');
 const commercialBtn = document.getElementById('source-commercial');
 const commercialSearch = document.getElementById('commercial-search');
+const cjClearance = document.getElementById('cj-filter-clearance');
+const cjCountry = document.getElementById('cj-filter-country');
+const cjCompany = document.getElementById('cj-filter-company');
+const cjLocation = document.getElementById('cj-filter-location');
+const cjSalaryMin = document.getElementById('cj-filter-salary-min');
+const cjClearBtn = document.getElementById('cj-filter-clear');
 const COMMERCIAL_PER_PAGE = 25;
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -40,12 +47,14 @@ let active = false;
 let mapBbox = null;
 let source = 'federal';
 let searchTimer = null;
+let cjFilterTimer = null;
+let commercialFiltersLoaded = false;
 let federalSortValue = sortField.value;
 
 // Toggle between views
 mapBtn.addEventListener('click', () => {
-    // The filter panel is shared with the map view; if Commercial dimmed/hid its
-    // controls, reset to federal through setSource before revealing the map.
+    // The filter panel is shared with the map view; if Commercial swapped in its
+    // own controls, reset to federal through setSource before revealing the map.
     if (source === 'commercial') setSource('federal');
     active = false;
     mapEl.style.display = '';
@@ -69,19 +78,22 @@ listBtn.addEventListener('click', () => {
 federalBtn.addEventListener('click', () => setSource('federal'));
 commercialBtn.addEventListener('click', () => setSource('commercial'));
 
-// Commercial (ClearanceJobs) is a list-only source: the federal map filters are
-// dimmed, but sorting stays available with a commercial-specific option set.
+// Commercial (ClearanceJobs) and Federal (USAJobs) each own a filter section in
+// the shared sidebar; switching source swaps which one is visible along with the
+// sort option set.
 function setSource(next) {
     if (source === next) return;
     source = next;
     const commercial = next === 'commercial';
     federalBtn.classList.toggle('active', !commercial);
     commercialBtn.classList.toggle('active', commercial);
-    filterPanel.classList.toggle('source-disabled', commercial);
+    federalFilters.style.display = commercial ? 'none' : '';
+    commercialFilters.style.display = commercial ? '' : 'none';
     commercialSearch.style.display = commercial ? '' : 'none';
     if (commercial) {
         federalSortValue = sortField.value;
         sortField.innerHTML = COMMERCIAL_SORT_OPTIONS;
+        loadCommercialFilters();
     } else {
         sortField.innerHTML = FEDERAL_SORT_OPTIONS;
         sortField.value = federalSortValue;
@@ -90,12 +102,65 @@ function setSource(next) {
     loadList();
 }
 
+// Facet options for the commercial sidebar — fetched once per session, since the
+// active-set counts drift slowly and don't warrant a refetch on every toggle.
+async function loadCommercialFilters() {
+    if (commercialFiltersLoaded) return;
+    try {
+        const data = await fetchJSON('/api/commercial/filters', { key: 'cj-filters' });
+        fillFacet(cjClearance, data.clearances);
+        fillFacet(cjCountry, data.countries);
+        commercialFiltersLoaded = true;
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        console.error('Failed to load commercial filters:', err);
+    }
+}
+
+function fillFacet(select, options) {
+    while (select.options.length > 1) select.remove(1);
+    for (const opt of options || []) {
+        const el = document.createElement('option');
+        el.value = opt.value;
+        el.textContent = `${opt.value} (${opt.count.toLocaleString()})`;
+        select.appendChild(el);
+    }
+}
+
 commercialSearch.addEventListener('input', () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
         currentPage = 1;
         loadList();
     }, SEARCH_DEBOUNCE_MS);
+});
+
+for (const sel of [cjClearance, cjCountry]) {
+    sel.addEventListener('change', () => {
+        currentPage = 1;
+        loadList();
+    });
+}
+
+for (const input of [cjCompany, cjLocation, cjSalaryMin]) {
+    input.addEventListener('input', () => {
+        clearTimeout(cjFilterTimer);
+        cjFilterTimer = setTimeout(() => {
+            currentPage = 1;
+            loadList();
+        }, SEARCH_DEBOUNCE_MS);
+    });
+}
+
+cjClearBtn.addEventListener('click', () => {
+    cjClearance.value = '';
+    cjCountry.value = '';
+    cjCompany.value = '';
+    cjLocation.value = '';
+    cjSalaryMin.value = '';
+    commercialSearch.value = '';
+    currentPage = 1;
+    loadList();
 });
 
 sortField.addEventListener('change', () => {
@@ -155,6 +220,11 @@ async function loadCommercial() {
     });
     const keyword = commercialSearch.value.trim();
     if (keyword) params.set('q', keyword);
+    if (cjClearance.value) params.set('clearance', cjClearance.value);
+    if (cjCountry.value) params.set('country', cjCountry.value);
+    if (cjCompany.value.trim()) params.set('company', cjCompany.value.trim());
+    if (cjLocation.value.trim()) params.set('location', cjLocation.value.trim());
+    if (cjSalaryMin.value) params.set('salary_min', cjSalaryMin.value);
 
     listBody.innerHTML = '<div class="list-loading">Loading...</div>';
 
