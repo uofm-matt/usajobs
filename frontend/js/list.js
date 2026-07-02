@@ -147,6 +147,15 @@ async function loadCommercial() {
     }
 }
 
+// Commercial salaries arrive as bare integers (annual USD), unlike the
+// pre-formatted federal salary string.
+function formatSalaryRange(min, max) {
+    const fmt = (n) => `$${n.toLocaleString()}`;
+    if (min && max) return `${fmt(min)}–${fmt(max)}`;
+    if (min || max) return fmt(min || max);
+    return '';
+}
+
 function renderCommercial(data) {
     listCount.textContent = pluralJobs(data.total);
 
@@ -165,6 +174,7 @@ function renderCommercial(data) {
 
         const location = (job.locations && job.locations[0]) || 'N/A';
         const posted = formatDate(job.date_posted);
+        const salary = formatSalaryRange(job.salary_min, job.salary_max);
 
         card.innerHTML = `
             <div class="job-card-main">
@@ -173,6 +183,7 @@ function renderCommercial(data) {
             </div>
             <div class="job-card-details">
                 <div class="job-card-meta">
+                    ${salary ? `<span class="job-meta-item job-meta-salary">${salary}</span>` : ''}
                     <span class="job-meta-item job-meta-location">${escapeHTML(location)}</span>
                     ${job.industry ? `<span class="job-meta-item">${escapeHTML(job.industry)}</span>` : ''}
                     ${job.clearance ? `<span class="job-meta-item job-meta-clearance">${escapeHTML(job.clearance)}</span>` : ''}
