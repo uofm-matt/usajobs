@@ -808,10 +808,18 @@ class TestMapEndpoint:
         )
         sql = conn.fetch.call_args.args[0]
         assert "data->>'securityClearanceRequirement' = ANY($1)" in sql
-        assert "lo.locality_area IS DISTINCT FROM $2" in sql  # NCR locality
+        assert "lo.locality_area IS DISTINCT FROM $2" in sql  # job-level NCR
         assert "lo.lon BETWEEN $3 AND $5" in sql
         assert "lo.lat BETWEEN $4 AND $6" in sql
-        assert conn.fetch.call_args.args[1:] == (["Secret"], NCR_LOCALITY, *BBOX_COORDS)
+        # Point-level NCR filter binds after the bbox so a surviving multi-site
+        # job drops its DC pin but keeps its non-DC ones.
+        assert "lo.locality_area IS DISTINCT FROM $7" in sql
+        assert conn.fetch.call_args.args[1:] == (
+            ["Secret"],
+            NCR_LOCALITY,
+            *BBOX_COORDS,
+            NCR_LOCALITY,
+        )
 
     async def test_point_shape(self, client):
         ac, conn = client

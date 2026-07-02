@@ -455,6 +455,15 @@ async def get_commercial_map(
     n = len(params)
     params.extend([west, south, east, north])
 
+    # exclude_ncr is a per-POINT filter on the map (not just per-job): a multi-site
+    # job that survives the job-level clause because it also lists a non-DC location
+    # must still not drop a pin inside the NCR. Filter the individual points by their
+    # materialized locality_area so a "Fort Meade + Houston" job shows only Houston.
+    ncr_point = ""
+    if exclude_ncr:
+        params.append(NCR_LOCALITY)
+        ncr_point = f"AND lo.locality_area IS DISTINCT FROM ${len(params)}"
+
     # The matched CTE runs _build_where over commercial.jobs_raw alone, byte-for-byte
     # the same context as the list endpoint (so the loc EXISTS's jobs_raw.source
     # correlation resolves the same way); the join to job_locations then unnests one
@@ -480,6 +489,7 @@ async def get_commercial_map(
         WHERE lo.lat IS NOT NULL AND lo.lon IS NOT NULL
           AND lo.lon BETWEEN ${n + 1} AND ${n + 3}
           AND lo.lat BETWEEN ${n + 2} AND ${n + 4}
+          {ncr_point}
         LIMIT {MAP_LIMIT}
     """
 
