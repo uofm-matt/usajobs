@@ -21,7 +21,9 @@ const federalBtn = document.getElementById('source-federal');
 const commercialBtn = document.getElementById('source-commercial');
 const commercialSearch = document.getElementById('commercial-search');
 const cjCompany = document.getElementById('cj-filter-company');
-const cjCompanyOptions = document.getElementById('cj-company-options');
+const cjCompanyCombo = document.getElementById('cj-company-combo');
+const cjCompanyPanel = document.getElementById('cj-company-panel');
+let cjCompanies = [];
 const cjLocation = document.getElementById('cj-filter-location');
 const cjSalaryMin = document.getElementById('cj-filter-salary-min');
 const cjPosted = document.getElementById('cj-filter-posted');
@@ -155,8 +157,8 @@ async function loadCommercialFilters() {
     }
 }
 
-// Employer suggestions for the company box, ordered most-jobs-first and scoped to
-// the current map viewport, so the dropdown reflects who is hiring on screen. The
+// Employer suggestions for the company combobox, ordered most-jobs-first and scoped
+// to the current map viewport, so the list reflects who is hiring on screen. The
 // input stays free-text (ILIKE), so a typed partial still works if not picked.
 async function loadCompanyOptions() {
     const params = new URLSearchParams();
@@ -165,18 +167,65 @@ async function loadCompanyOptions() {
         const data = await fetchJSON(`/api/commercial/companies?${params}`, {
             key: 'cj-companies',
         });
-        cjCompanyOptions.innerHTML = '';
-        for (const c of data.companies) {
-            const opt = document.createElement('option');
-            opt.value = c.value;
-            opt.label = `${c.value} (${c.count.toLocaleString()})`;
-            cjCompanyOptions.appendChild(opt);
-        }
+        cjCompanies = data.companies;
+        if (!cjCompanyPanel.hidden) renderCompanyPanel();
     } catch (err) {
         if (err.name === 'AbortError') return;
         console.error('Failed to load company options:', err);
     }
 }
+
+// Render the (viewport-scoped, count-ordered) employer list into the panel,
+// filtered by whatever is typed. Click opens it; typing narrows it.
+function renderCompanyPanel() {
+    const q = cjCompany.value.trim().toLowerCase();
+    const matches = q
+        ? cjCompanies.filter((c) => c.value.toLowerCase().includes(q))
+        : cjCompanies;
+    if (!matches.length) {
+        cjCompanyPanel.innerHTML = '<div class="cj-combo-empty">No employers in view</div>';
+        return;
+    }
+    cjCompanyPanel.innerHTML = matches
+        .map(
+            (c) =>
+                `<div class="cj-combo-option" data-value="${escapeHTML(c.value)}">` +
+                `${escapeHTML(c.value)} ` +
+                `<span class="cj-combo-count">(${c.count.toLocaleString()})</span></div>`
+        )
+        .join('');
+}
+
+function openCompanyPanel() {
+    renderCompanyPanel();
+    cjCompanyPanel.hidden = false;
+}
+
+function closeCompanyPanel() {
+    cjCompanyPanel.hidden = true;
+}
+
+cjCompany.addEventListener('focus', openCompanyPanel);
+cjCompany.addEventListener('input', () => {
+    if (cjCompanyPanel.hidden) cjCompanyPanel.hidden = false;
+    renderCompanyPanel();
+});
+cjCompanyPanel.addEventListener('mousedown', (e) => {
+    // mousedown (not click) so it fires before the input's blur closes the panel.
+    const opt = e.target.closest('.cj-combo-option');
+    if (!opt) return;
+    e.preventDefault();
+    cjCompany.value = opt.dataset.value;
+    closeCompanyPanel();
+    clearTimeout(cjFilterTimer);
+    commercialChanged();
+});
+document.addEventListener('click', (e) => {
+    if (!cjCompanyCombo.contains(e.target)) closeCompanyPanel();
+});
+cjCompany.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeCompanyPanel();
+});
 
 // Render one checkbox per facet value into the group body, all checked. Changes
 // apply immediately (no debounce) and reset to page 1.

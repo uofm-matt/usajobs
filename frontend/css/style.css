@@ -322,6 +322,51 @@ html, body {
     accent-color: var(--color-accent);
 }
 
+/* Company combobox: click opens the full ordered list; typing filters it. */
+.cj-combo {
+    position: relative;
+}
+
+.cj-combo-panel {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 500;
+    margin-top: 2px;
+    max-height: 240px;
+    overflow-y: auto;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
+}
+
+.cj-combo-option {
+    padding: 5px 8px;
+    font-size: 13px;
+    color: #444;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.cj-combo-option:hover,
+.cj-combo-option.active {
+    background: var(--color-hover-bg);
+}
+
+.cj-combo-option .cj-combo-count {
+    color: #999;
+}
+
+.cj-combo-empty {
+    padding: 6px 8px;
+    font-size: 12px;
+    color: #999;
+}
+
 /* ── Detail panel ── */
 #detail-panel {
     position: fixed;
