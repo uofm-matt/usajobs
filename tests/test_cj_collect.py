@@ -40,6 +40,8 @@ def _args(**over):
         slug_keywords=cj_collect.DEFAULT_SLUG_KEYWORDS,
         countries=None,
         all_slugs=False,
+        fetch_only=False,
+        shard=None,
     )
     return SimpleNamespace(**{**base, **over})
 
@@ -437,6 +439,18 @@ class TestSweepSetDiff:
             cur, cj_collect.DEFAULT_SLUG_KEYWORDS, all_slugs=True
         )
         assert every == [("9", "u9"), ("8", "u8")]  # both, scope ignored
+
+    def test_shard_clause_partitions_backlog(self):
+        cur = MagicMock()
+        cur.fetchall.return_value = []
+        cj_collect._backlog_candidates(cur, [], all_slugs=True, shard=(1, 2))
+        assert "ext_id::bigint % 2 = 1" in cur.execute.call_args.args[0]
+
+    def test_shard_arg_validates(self):
+        assert cj_collect._shard_arg("0/2") == (0, 2)
+        assert cj_collect._shard_arg("1/4") == (1, 4)
+        with pytest.raises(Exception):
+            cj_collect._shard_arg("2/2")  # n must be < m
 
     def test_absent_id_increments_misses(self):
         _, cur, _ = self._run(

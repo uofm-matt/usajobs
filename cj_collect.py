@@ -298,8 +298,20 @@ def _apply_sightings(cur, seen: list[str]) -> int:
     return returned
 
 
+def _shard_sql(shard: tuple[int, int] | None) -> str:
+    """SQL fragment restricting to one shard of ext_ids so parallel runs stay
+    disjoint. n, m are validated ints (argparse), safe to interpolate."""
+    if shard is None:
+        return ""
+    n, m = shard
+    return f" AND ext_id::bigint % {m} = {n}"
+
+
 def _backlog_candidates(
-    cur, keywords: list[str], all_slugs: bool = False
+    cur,
+    keywords: list[str],
+    all_slugs: bool = False,
+    shard: tuple[int, int] | None = None,
 ) -> list[tuple[str, str]]:
     """Never-fetched rows — this sweep's fresh inserts plus prior sweeps' leftovers
     (deferred, non-200, mid-crash). fetched_at IS NULL is the never-attempted marker,
@@ -313,7 +325,7 @@ def _backlog_candidates(
     cur.execute(
         "SELECT ext_id, url, slug FROM commercial.jobs_raw "
         "WHERE source = %s AND data IS NULL AND fetched_at IS NULL "
-        "AND consecutive_misses = 0 ORDER BY ext_id::bigint DESC",
+        f"AND consecutive_misses = 0{_shard_sql(shard)} ORDER BY ext_id::bigint DESC",
         (SOURCE,),
     )
     return [
@@ -323,12 +335,14 @@ def _backlog_candidates(
     ]
 
 
-def _refresh_candidates(cur, refresh_days: int) -> list[tuple[str, str]]:
+def _refresh_candidates(
+    cur, refresh_days: int, shard: tuple[int, int] | None = None
+) -> list[tuple[str, str]]:
     """Data-bearing rows past their refresh age whose posting hasn't clearly expired."""
     cur.execute(
         "SELECT ext_id, url, data FROM commercial.jobs_raw "
         "WHERE source = %s AND data IS NOT NULL AND consecutive_misses = 0 "
-        "AND fetched_at < now() - make_interval(days => %s)",
+        f"AND fetched_at < now() - make_interval(days => %s){_shard_sql(shard)}",
         (SOURCE, refresh_days),
     )
     now = datetime.now(UTC)
@@ -609,57 +623,64 @@ def fetch_detail(
 
 
 def sweep(args) -> None:
-    """Set-diff the sitemaps against jobs_raw, then fetch capped detail pages."""
-    sitemap = dict(_fetch_sitemap_entries())
-    if len(sitemap) < MIN_HEALTHY_SWEEP:
-        print(
-            f"Only {len(sitemap)} sitemap jobs (< {MIN_HEALTHY_SWEEP}) — likely a fetch "
-            "failure; aborting before any DB write."
-        )
-        sys.exit(1)
+    """Set-diff the sitemaps against jobs_raw, then fetch capped detail pages.
+
+    --fetch-only skips the sitemap set-diff and only fetches the backlog, so
+    parallel sharded workers don't each re-run (and contend on) the sweep."""
+    shard = args.shard
+    sitemap: dict[str, str] = {}
+    if not args.fetch_only:
+        sitemap = dict(_fetch_sitemap_entries())
+        if len(sitemap) < MIN_HEALTHY_SWEEP:
+            print(
+                f"Only {len(sitemap)} sitemap jobs (< {MIN_HEALTHY_SWEEP}) — likely a "
+                "fetch failure; aborting before any DB write."
+            )
+            sys.exit(1)
 
     conn = psycopg2.connect(**_db_config())
     conn.autocommit = False
     stats: Counter[str] = Counter()
 
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT ext_id, consecutive_misses FROM commercial.jobs_raw "
-            "WHERE source = %s",
-            (SOURCE,),
-        )
-        existing = dict(cur.fetchall())
-        sitemap_ids, db_ids = set(sitemap), set(existing)
-        seen = sitemap_ids & db_ids
-        absent = db_ids - sitemap_ids
-        new = sitemap_ids - db_ids
-
-        returned = _apply_sightings(cur, list(seen)) if seen else 0
-        if absent:
+        if not args.fetch_only:
             cur.execute(
-                "UPDATE commercial.jobs_raw "
-                "SET consecutive_misses = consecutive_misses + 1 "
-                "WHERE source = %s AND ext_id = ANY(%s)",
-                (SOURCE, list(absent)),
+                "SELECT ext_id, consecutive_misses FROM commercial.jobs_raw "
+                "WHERE source = %s",
+                (SOURCE,),
             )
-        if new:
-            cur.executemany(
-                "INSERT INTO commercial.jobs_raw (source, ext_id, url, slug) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT (source, ext_id) DO NOTHING",
-                [
-                    (SOURCE, eid, _job_url(eid, sitemap[eid]), sitemap[eid])
-                    for eid in new
-                ],
+            existing = dict(cur.fetchall())
+            sitemap_ids, db_ids = set(sitemap), set(existing)
+            seen = sitemap_ids & db_ids
+            absent = db_ids - sitemap_ids
+            new = sitemap_ids - db_ids
+
+            returned = _apply_sightings(cur, list(seen)) if seen else 0
+            if absent:
+                cur.execute(
+                    "UPDATE commercial.jobs_raw "
+                    "SET consecutive_misses = consecutive_misses + 1 "
+                    "WHERE source = %s AND ext_id = ANY(%s)",
+                    (SOURCE, list(absent)),
+                )
+            if new:
+                cur.executemany(
+                    "INSERT INTO commercial.jobs_raw (source, ext_id, url, slug) "
+                    "VALUES (%s, %s, %s, %s) ON CONFLICT (source, ext_id) DO NOTHING",
+                    [
+                        (SOURCE, eid, _job_url(eid, sitemap[eid]), sitemap[eid])
+                        for eid in new
+                    ],
+                )
+            conn.commit()
+            print(
+                f"Sitemap: {len(sitemap)} jobs. New: {len(new)}  Absent: {len(absent)}  "
+                f"Returned after gap: {returned}"
             )
-        conn.commit()
-        print(
-            f"Sitemap: {len(sitemap)} jobs. New: {len(new)}  Absent: {len(absent)}  "
-            f"Returned after gap: {returned}"
-        )
 
         companies = _load_companies(cur)
-        backlog = _backlog_candidates(cur, args.slug_keywords, args.all_slugs)
-        refresh = _refresh_candidates(cur, args.refresh_days)
+        backlog = _backlog_candidates(cur, args.slug_keywords, args.all_slugs, shard)
+        refresh = _refresh_candidates(cur, args.refresh_days, shard)
         queue = backlog + refresh
         to_fetch = queue[: args.limit]
         print(
@@ -750,6 +771,13 @@ def _country_list(raw: str) -> list[str]:
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
+def _shard_arg(raw: str) -> tuple[int, int]:
+    n, m = (int(x) for x in raw.split("/", 1))
+    if not 0 <= n < m:
+        raise argparse.ArgumentTypeError("shard must be N/M with 0 <= N < M")
+    return (n, m)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Collect ClearanceJobs into the commercial schema"
@@ -786,6 +814,17 @@ if __name__ == "__main__":
         "--all-slugs",
         action="store_true",
         help="Fetch every posting, ignoring --slug-keywords (a full backfill)",
+    )
+    parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="Skip the sitemap set-diff; only fetch the backlog (for sharded runs)",
+    )
+    parser.add_argument(
+        "--shard",
+        type=_shard_arg,
+        default=None,
+        help="Fetch only shard N of M by ext_id (e.g. 0/2), for parallel workers",
     )
     parser.add_argument(
         "--countries",
