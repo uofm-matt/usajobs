@@ -534,6 +534,18 @@ async def get_commercial_map(
         params.append(NCR_LOCALITY)
         ncr_point = f"AND lo.locality_area IS DISTINCT FROM ${len(params)}"
 
+    # country and the location facet are also per-POINT on the map: a job kept
+    # because ONE of its locations still matches (e.g. a UK site with US unchecked)
+    # must plot only the matching points, not its filtered-out ones (Salt Lake City).
+    country_point = ""
+    if country:
+        params.append(country)
+        country_point = f"AND lo.country = ANY(${len(params)})"
+    loc_point = ""
+    if loc:
+        params.append(loc)
+        loc_point = f"AND {_label_expr('lo')} = ANY(${len(params)})"
+
     # The matched CTE runs _build_where over commercial.jobs_raw alone, byte-for-byte
     # the same context as the list endpoint (so the loc EXISTS's jobs_raw.source
     # correlation resolves the same way); the join to job_locations then unnests one
@@ -560,7 +572,7 @@ async def get_commercial_map(
         WHERE lo.lat IS NOT NULL AND lo.lon IS NOT NULL
           AND lo.lon BETWEEN ${n + 1} AND ${n + 3}
           AND lo.lat BETWEEN ${n + 2} AND ${n + 4}
-          {ncr_point}
+          {ncr_point} {country_point} {loc_point}
         LIMIT {MAP_LIMIT}
     """
 

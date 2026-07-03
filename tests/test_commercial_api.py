@@ -878,11 +878,34 @@ class TestMapEndpoint:
             params={"bbox": BBOX, "zoom": 6, "loc": ["Denver, CO"]},
         )
         sql = conn.fetch.call_args.args[0]
-        # loc binds $1; bbox continues at $2..$5, coherent with the content filter.
+        # loc binds $1 (job-level in the matched CTE); bbox at $2..$5; then loc binds
+        # again at $6 as the per-point filter so a kept multi-site job drops the
+        # non-selected pins. So the loc list is passed twice.
         assert f"{_LABEL} = ANY($1)" in sql
         assert "lo.lon BETWEEN $2 AND $4" in sql
         assert "lo.lat BETWEEN $3 AND $5" in sql
-        assert conn.fetch.call_args.args[1:] == (["Denver, CO"], *BBOX_COORDS)
+        assert f"{_LABEL} = ANY($6)" in sql
+        assert conn.fetch.call_args.args[1:] == (
+            ["Denver, CO"],
+            *BBOX_COORDS,
+            ["Denver, CO"],
+        )
+
+    async def test_country_filters_points_on_map(self, client):
+        # A job kept because one location matches the country still must not plot
+        # its filtered-out points: country is applied per-point on the map too.
+        ac, conn = client
+        await ac.get(
+            "/api/commercial/map", params={"bbox": BBOX, "country": ["United Kingdom"]}
+        )
+        sql = conn.fetch.call_args.args[0]
+        assert "lo.country = ANY($1)" in sql  # job-level in matched CTE
+        assert "lo.country = ANY($6)" in sql  # per-point on the join
+        assert conn.fetch.call_args.args[1:] == (
+            ["United Kingdom"],
+            *BBOX_COORDS,
+            ["United Kingdom"],
+        )
 
     async def test_facet_and_bbox_combine(self, client):
         ac, conn = client
