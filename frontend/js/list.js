@@ -21,6 +21,7 @@ const federalBtn = document.getElementById('source-federal');
 const commercialBtn = document.getElementById('source-commercial');
 const commercialSearch = document.getElementById('commercial-search');
 const cjCompany = document.getElementById('cj-filter-company');
+const cjCompanyOptions = document.getElementById('cj-company-options');
 const cjLocation = document.getElementById('cj-filter-location');
 const cjSalaryMin = document.getElementById('cj-filter-salary-min');
 const cjPosted = document.getElementById('cj-filter-posted');
@@ -114,6 +115,7 @@ function setSource(next) {
         federalSortValue = sortField.value;
         sortField.innerHTML = COMMERCIAL_SORT_OPTIONS;
         loadCommercialFilters();
+        loadCompanyOptions();
     } else {
         sortField.innerHTML = FEDERAL_SORT_OPTIONS;
         sortField.value = federalSortValue;
@@ -150,6 +152,29 @@ async function loadCommercialFilters() {
     } catch (err) {
         if (err.name === 'AbortError') return;
         console.error('Failed to load commercial filters:', err);
+    }
+}
+
+// Employer suggestions for the company box, ordered most-jobs-first and scoped to
+// the current map viewport, so the dropdown reflects who is hiring on screen. The
+// input stays free-text (ILIKE), so a typed partial still works if not picked.
+async function loadCompanyOptions() {
+    const params = new URLSearchParams();
+    if (mapBbox) params.set('bbox', mapBbox);
+    try {
+        const data = await fetchJSON(`/api/commercial/companies?${params}`, {
+            key: 'cj-companies',
+        });
+        cjCompanyOptions.innerHTML = '';
+        for (const c of data.companies) {
+            const opt = document.createElement('option');
+            opt.value = c.value;
+            opt.label = `${c.value} (${c.count.toLocaleString()})`;
+            cjCompanyOptions.appendChild(opt);
+        }
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        console.error('Failed to load company options:', err);
     }
 }
 
@@ -248,6 +273,8 @@ window.addEventListener('filters-changed', () => {
 // Keep the list scoped to the current map viewport (event from app.js on map move)
 window.addEventListener('map-moved', (e) => {
     mapBbox = e.detail;
+    // Refresh the employer dropdown to who's hiring in the new viewport.
+    if (source === 'commercial') loadCompanyOptions();
     if (active) {
         currentPage = 1;
         loadList();

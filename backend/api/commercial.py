@@ -641,3 +641,35 @@ async def get_commercial_filters(request: Request):
         ],
         "locations": [{"value": r["value"], "count": r["c"]} for r in locations],
     }
+
+
+@router.get("/api/commercial/companies")
+@limiter.limit("120/minute")
+async def get_commercial_companies(
+    request: Request,
+    bbox: Annotated[str | None, Query(description="west,south,east,north")] = None,
+):
+    """Employers with active postings, most jobs first — the company dropdown's
+    suggestions. Scoped to the map viewport when a bbox is given, so the list
+    reflects who is hiring in the area currently on screen."""
+    bounds = None
+    if bbox is not None:
+        try:
+            bounds = _parse_bbox(bbox)
+        except ValueError as e:
+            return Response(
+                content=json.dumps({"error": str(e), "code": 422}),
+                status_code=422,
+                media_type="application/json",
+            )
+    where, params = _build_where(bbox=bounds)
+    pool = get_pool()
+    async with pool.acquire(timeout=5) as conn:
+        rows = await conn.fetch(
+            "SELECT data->'hiringOrganization'->>'name' AS value, COUNT(*) AS c "
+            f"FROM commercial.jobs_raw WHERE {where} "
+            "AND data->'hiringOrganization'->>'name' IS NOT NULL "
+            "GROUP BY value ORDER BY c DESC, value LIMIT 1000",
+            *params,
+        )
+    return {"companies": [{"value": r["value"], "count": r["c"]} for r in rows]}

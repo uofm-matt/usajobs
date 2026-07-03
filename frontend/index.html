@@ -128,7 +128,9 @@
                 </div>
 
                 <label for="cj-filter-company">Company</label>
-                <input type="text" id="cj-filter-company" placeholder="e.g. Booz Allen">
+                <input type="text" id="cj-filter-company" list="cj-company-options"
+                    placeholder="Search employers in view" autocomplete="off">
+                <datalist id="cj-company-options"></datalist>
 
                 <label for="cj-filter-location">Location</label>
                 <input type="text" id="cj-filter-location" placeholder="City or state">

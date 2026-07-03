@@ -773,6 +773,37 @@ class TestFiltersEndpoint:
         assert "ORDER BY c DESC, value" in locations_sql
 
 
+class TestCompaniesEndpoint:
+    async def test_companies_ordered_by_count(self, client):
+        ac, conn = client
+        conn.fetch.return_value = [
+            {"value": "BAE Systems", "c": 142},
+            {"value": "Leidos", "c": 88},
+        ]
+        r = await ac.get("/api/commercial/companies")
+        body = r.json()
+        assert body["companies"] == [
+            {"value": "BAE Systems", "count": 142},
+            {"value": "Leidos", "count": 88},
+        ]
+        sql = conn.fetch.call_args.args[0]
+        assert "hiringOrganization'->>'name'" in sql
+        assert "GROUP BY value ORDER BY c DESC, value" in sql
+
+    async def test_bbox_scopes_company_list(self, client):
+        ac, conn = client
+        conn.fetch.return_value = []
+        await ac.get("/api/commercial/companies", params={"bbox": BBOX})
+        sql = conn.fetch.call_args.args[0]
+        assert "commercial.job_locations lo" in sql  # viewport EXISTS clause
+        assert conn.fetch.call_args.args[1:] == BBOX_COORDS
+
+    async def test_invalid_bbox_rejected(self, client):
+        ac, _ = client
+        r = await ac.get("/api/commercial/companies", params={"bbox": "1,2,3"})
+        assert r.status_code == 422
+
+
 # --- Map endpoint (mocked pool) ---
 
 BBOX = "-109,37,-102,41"
