@@ -93,12 +93,12 @@ class TestBuildWhere:
 
     def test_country_multi_value_exists_over_normalized_locations(self):
         where, params = _build_where(country=["United States", "Germany"])
-        # EXISTS over the normalized jobLocation array (list or single Place),
-        # matching addressCountry against the text[] param with = ANY.
-        assert "jsonb_typeof(data->'jobLocation') = 'array'" in where
-        assert "ELSE jsonb_build_array(data->'jobLocation') END" in where
-        assert "loc->'address'->>'addressCountry' = ANY($1)" in where
-        assert "jsonb_path_exists" not in where
+        # EXISTS over commercial.job_locations using the NORMALIZED country, so US
+        # variants ("US"/"USA") collapse to one value instead of leaking.
+        assert "EXISTS (SELECT 1 FROM commercial.job_locations lo" in where
+        assert "lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id" in where
+        assert "lo.country = ANY($1)" in where
+        assert "addressCountry" not in where
         assert params == [["United States", "Germany"]]
 
     def test_industry_multi_value_any(self):
@@ -119,7 +119,7 @@ class TestBuildWhere:
             employment_type=["Full-time"],
         )
         assert "data->>'securityClearanceRequirement' = ANY($1)" in where
-        assert "loc->'address'->>'addressCountry' = ANY($2)" in where
+        assert "lo.country = ANY($2)" in where
         assert "data->>'industry' = ANY($3)" in where
         assert "data->>'employmentType' = ANY($4)" in where
         assert params == [["Secret"], ["United States"], ["Aerospace"], ["Full-time"]]
@@ -543,9 +543,8 @@ class TestEndpoint:
         )
         sql = conn.fetch.call_args.args[0]
         assert "jsonb_path_exists" not in sql
-        assert "jsonb_array_elements" in sql
-        assert "ELSE jsonb_build_array(data->'jobLocation') END" in sql
-        assert "loc->'address'->>'addressCountry' = ANY($1)" in sql
+        assert "commercial.job_locations lo" in sql
+        assert "lo.country = ANY($1)" in sql
         assert conn.fetch.call_args.args[1:] == (["United States", "Germany"],)
 
     async def test_industry_multi_value_binds_one_list_param(self, client):
@@ -576,7 +575,7 @@ class TestEndpoint:
         )
         sql = conn.fetch.call_args.args[0]
         assert "data->>'securityClearanceRequirement' = ANY($1)" in sql
-        assert "loc->'address'->>'addressCountry' = ANY($2)" in sql
+        assert "lo.country = ANY($2)" in sql
         assert "data->>'industry' = ANY($3)" in sql
         assert "data->>'employmentType' = ANY($4)" in sql
         assert conn.fetch.call_args.args[1:] == (
@@ -752,10 +751,11 @@ class TestFiltersEndpoint:
         ):
             assert ACTIVE in sql
         assert "securityClearanceRequirement" in clearance_sql
-        # Country facet normalizes list/single-object jobLocation like the filter.
-        assert "addressCountry" in country_sql
-        assert "jsonb_array_elements" in country_sql
-        assert "ELSE jsonb_build_array(data->'jobLocation') END" in country_sql
+        # Country facet reads the normalized job_locations.country (US variants
+        # collapsed), per-job, so there's one "United States" option, not several.
+        assert "commercial.job_locations lo" in country_sql
+        assert "lo.country" in country_sql
+        assert "COUNT(DISTINCT ext_id)" in country_sql
         assert "data->>'industry'" in industry_sql
         assert "data->>'employmentType'" in employment_sql
 

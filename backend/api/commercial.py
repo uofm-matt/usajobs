@@ -200,9 +200,13 @@ def _build_where(
         clauses.append(f"data->'hiringOrganization'->>'name' ILIKE ${len(params)}")
     if country:
         params.append(country)
+        # Match the NORMALIZED country on job_locations, not the raw JSON — the
+        # collector collapses "US"/"USA"/"U.S." into "United States", so the filter
+        # (and the facet) treat them as one value instead of leaking variants.
         clauses.append(
-            f"EXISTS (SELECT 1 FROM jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
-            f"WHERE loc->'address'->>'addressCountry' = ANY(${len(params)}))"
+            "EXISTS (SELECT 1 FROM commercial.job_locations lo "
+            "WHERE lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id "
+            f"AND lo.country = ANY(${len(params)}))"
         )
     if industry:
         params.append(industry)
@@ -600,12 +604,16 @@ async def get_commercial_filters(request: Request):
             "AND data->>'securityClearanceRequirement' IS NOT NULL "
             "GROUP BY value ORDER BY c DESC, value"
         )
+        # Normalized country from job_locations (US variants already collapsed to
+        # "United States"), per-job so a multi-location posting counts once.
         countries = await conn.fetch(
-            "SELECT value, COUNT(*) AS c FROM ("
-            "SELECT DISTINCT ext_id, loc->'address'->>'addressCountry' AS value "
-            f"FROM commercial.jobs_raw, jsonb_array_elements({_JOB_LOCATIONS}) AS loc "
-            f"WHERE {_ACTIVE}) sub "
-            "WHERE value IS NOT NULL GROUP BY value ORDER BY c DESC, value"
+            "SELECT value, COUNT(DISTINCT ext_id) AS c FROM ("
+            "SELECT lo.ext_id, lo.country AS value FROM commercial.job_locations lo "
+            "WHERE lo.country IS NOT NULL AND EXISTS ("
+            "SELECT 1 FROM commercial.jobs_raw "
+            f"WHERE jobs_raw.source = lo.source AND jobs_raw.ext_id = lo.ext_id "
+            f"AND {_ACTIVE})) sub "
+            "GROUP BY value ORDER BY c DESC, value"
         )
         industries = await conn.fetch(
             "SELECT data->>'industry' AS value, COUNT(*) AS c "
