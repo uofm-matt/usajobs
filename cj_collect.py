@@ -304,7 +304,8 @@ def _shard_sql(shard: tuple[int, int] | None) -> str:
     if shard is None:
         return ""
     n, m = shard
-    return f" AND ext_id::bigint % {m} = {n}"
+    # %% — psycopg2 treats a lone % as a parameter placeholder.
+    return f" AND ext_id::bigint %% {m} = {n}"
 
 
 def _backlog_candidates(

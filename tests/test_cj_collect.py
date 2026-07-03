@@ -444,7 +444,8 @@ class TestSweepSetDiff:
         cur = MagicMock()
         cur.fetchall.return_value = []
         cj_collect._backlog_candidates(cur, [], all_slugs=True, shard=(1, 2))
-        assert "ext_id::bigint % 2 = 1" in cur.execute.call_args.args[0]
+        # %% because psycopg2 treats a lone % as a parameter placeholder.
+        assert "ext_id::bigint %% 2 = 1" in cur.execute.call_args.args[0]
 
     def test_shard_arg_validates(self):
         assert cj_collect._shard_arg("0/2") == (0, 2)
