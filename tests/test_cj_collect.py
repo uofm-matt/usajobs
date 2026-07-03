@@ -39,6 +39,7 @@ def _args(**over):
         refresh_days=7,
         slug_keywords=cj_collect.DEFAULT_SLUG_KEYWORDS,
         countries=None,
+        all_slugs=False,
     )
     return SimpleNamespace(**{**base, **over})
 
@@ -421,6 +422,21 @@ class TestSweepSetDiff:
         assert "consecutive_misses = 0" in backlog_sql
         # Newest postings first so the fresh (<6-month) set fills before stale ids.
         assert "ORDER BY ext_id::bigint DESC" in backlog_sql
+
+    def test_all_slugs_bypasses_keyword_scope(self):
+        cur = MagicMock()
+        rows = [
+            ("9", "u9", "warehouse-forklift-operator"),
+            ("8", "u8", "cyber-analyst"),
+        ]
+        cur.fetchall.return_value = rows
+        scoped = cj_collect._backlog_candidates(cur, cj_collect.DEFAULT_SLUG_KEYWORDS)
+        assert scoped == [("8", "u8")]  # only the in-scope slug
+        cur.fetchall.return_value = rows
+        every = cj_collect._backlog_candidates(
+            cur, cj_collect.DEFAULT_SLUG_KEYWORDS, all_slugs=True
+        )
+        assert every == [("9", "u9"), ("8", "u8")]  # both, scope ignored
 
     def test_absent_id_increments_misses(self):
         _, cur, _ = self._run(

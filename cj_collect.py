@@ -298,14 +298,18 @@ def _apply_sightings(cur, seen: list[str]) -> int:
     return returned
 
 
-def _backlog_candidates(cur, keywords: list[str]) -> list[tuple[str, str]]:
+def _backlog_candidates(
+    cur, keywords: list[str], all_slugs: bool = False
+) -> list[tuple[str, str]]:
     """Never-fetched rows — this sweep's fresh inserts plus prior sweeps' leftovers
     (deferred, non-200, mid-crash). fetched_at IS NULL is the never-attempted marker,
     so deliberately skipped ids (_mark_id_only stamps fetched_at) don't churn.
 
     Newest first: CJ ext_ids are assigned in posting order, so the highest ids are
     the most recent postings. Fetching them first fills the (fresh, <6-month) set
-    the UI actually shows before spending the daily budget on stale evergreen ids."""
+    the UI actually shows before spending the daily budget on stale evergreen ids.
+
+    all_slugs bypasses the keyword scope to fetch every posting (a full backfill)."""
     cur.execute(
         "SELECT ext_id, url, slug FROM commercial.jobs_raw "
         "WHERE source = %s AND data IS NULL AND fetched_at IS NULL "
@@ -315,7 +319,7 @@ def _backlog_candidates(cur, keywords: list[str]) -> list[tuple[str, str]]:
     return [
         (ext_id, url)
         for ext_id, url, slug in cur.fetchall()
-        if _in_scope(slug, keywords)
+        if all_slugs or _in_scope(slug, keywords)
     ]
 
 
@@ -654,7 +658,7 @@ def sweep(args) -> None:
         )
 
         companies = _load_companies(cur)
-        backlog = _backlog_candidates(cur, args.slug_keywords)
+        backlog = _backlog_candidates(cur, args.slug_keywords, args.all_slugs)
         refresh = _refresh_candidates(cur, args.refresh_days)
         queue = backlog + refresh
         to_fetch = queue[: args.limit]
@@ -777,6 +781,11 @@ if __name__ == "__main__":
         type=_keyword_list,
         default=DEFAULT_SLUG_KEYWORDS,
         help="Comma-separated slug substrings that put a new job in scope",
+    )
+    parser.add_argument(
+        "--all-slugs",
+        action="store_true",
+        help="Fetch every posting, ignoring --slug-keywords (a full backfill)",
     )
     parser.add_argument(
         "--countries",
