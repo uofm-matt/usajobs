@@ -231,6 +231,20 @@ class TestBuildWhere:
         assert "make_interval" not in where
         assert params == []
 
+    def test_bbox_scopes_to_geocoded_locations(self):
+        where, params = _build_where(bbox=(-105.0, 39.0, -104.0, 40.0))
+        # Job-level viewport filter: EXISTS a geocoded location inside the box.
+        assert "EXISTS (SELECT 1 FROM commercial.job_locations lo" in where
+        assert "lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id" in where
+        assert "lo.lon BETWEEN $1 AND $3" in where
+        assert "lo.lat BETWEEN $2 AND $4" in where
+        assert params == [-105.0, 39.0, -104.0, 40.0]
+
+    def test_bbox_off_by_default(self):
+        where, params = _build_where()
+        assert "lo.lon BETWEEN" not in where
+        assert params == []
+
     def test_exclude_ncr_filters_on_materialized_locality(self):
         where, params = _build_where(exclude_ncr=True)
         # Keep a job unless EVERY geocoded location is in the DC locality area:

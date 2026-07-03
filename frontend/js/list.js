@@ -319,6 +319,9 @@ async function loadCommercial() {
         renderCommercial({ total: 0, jobs: [] });
         return;
     }
+    // Scope the list to the current map viewport, so zooming the map and returning
+    // to the list narrows it to what's on screen (mirrors the federal list).
+    if (mapBbox) params.set('bbox', mapBbox);
 
     listBody.innerHTML = '<div class="list-loading">Loading...</div>';
 

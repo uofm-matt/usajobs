@@ -172,6 +172,7 @@ def _build_where(
     exclude_ncr=False,
     remote=False,
     max_age_days=None,
+    bbox=None,
 ) -> tuple[str, list]:
     """WHERE clause + $N-bound params for active CJ postings with detail data.
 
@@ -277,6 +278,19 @@ def _build_where(
             f"left(data->>'datePosted', 10) >= "
             f"to_char(now() - make_interval(days => ${len(params)}), 'YYYY-MM-DD')"
         )
+    if bbox is not None:
+        # Job-level viewport filter for the list: surface a posting when any of its
+        # geocoded locations falls inside (west, south, east, north). The map
+        # endpoint filters at the point level in its own query instead.
+        west, south, east, north = bbox
+        base = len(params)
+        params.extend([west, south, east, north])
+        clauses.append(
+            "EXISTS (SELECT 1 FROM commercial.job_locations lo "
+            "WHERE lo.source = jobs_raw.source AND lo.ext_id = jobs_raw.ext_id "
+            f"AND lo.lon BETWEEN ${base + 1} AND ${base + 3} "
+            f"AND lo.lat BETWEEN ${base + 2} AND ${base + 4})"
+        )
 
     return " AND ".join(clauses), params
 
@@ -369,6 +383,7 @@ async def get_commercial_jobs(
     exclude_ncr: Annotated[bool, Query()] = False,
     remote: Annotated[bool, Query()] = False,
     max_age_days: Annotated[int | None, Query(ge=1, le=180)] = None,
+    bbox: Annotated[str | None, Query(description="west,south,east,north")] = None,
     sort: Annotated[str, Query()] = "posted",
     order: Annotated[str, Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
@@ -381,6 +396,16 @@ async def get_commercial_jobs(
             status_code=422,
             media_type="application/json",
         )
+    bounds = None
+    if bbox is not None:
+        try:
+            bounds = _parse_bbox(bbox)
+        except ValueError as e:
+            return Response(
+                content=json.dumps({"error": str(e), "code": 422}),
+                status_code=422,
+                media_type="application/json",
+            )
     direction = "DESC" if order == "desc" else "ASC"
     inner_order = f"{inner_exprs[sort]} {direction} NULLS LAST, ext_id"
     outer_order = (
@@ -400,6 +425,7 @@ async def get_commercial_jobs(
         exclude_ncr=exclude_ncr,
         remote=remote,
         max_age_days=max_age_days,
+        bbox=bounds,
     )
 
     pool = get_pool()
