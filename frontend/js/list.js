@@ -23,6 +23,7 @@ const commercialSearch = document.getElementById('commercial-search');
 const cjCompany = document.getElementById('cj-filter-company');
 const cjLocation = document.getElementById('cj-filter-location');
 const cjSalaryMin = document.getElementById('cj-filter-salary-min');
+const cjPosted = document.getElementById('cj-filter-posted');
 const cjExcludeNcr = document.getElementById('cj-filter-exclude-ncr');
 const cjRemote = document.getElementById('cj-filter-remote');
 const cjClearBtn = document.getElementById('cj-filter-clear');
@@ -199,6 +200,7 @@ commercialSearch.addEventListener('input', () => {
 
 cjExcludeNcr.addEventListener('change', commercialChanged);
 cjRemote.addEventListener('change', commercialChanged);
+cjPosted.addEventListener('change', commercialChanged);
 
 for (const input of [cjCompany, cjLocation, cjSalaryMin]) {
     input.addEventListener('input', () => {
@@ -213,6 +215,7 @@ cjClearBtn.addEventListener('click', () => {
     cjSalaryMin.value = '';
     cjExcludeNcr.checked = false;
     cjRemote.checked = false;
+    cjPosted.value = '';
     commercialSearch.value = '';
     for (const facet of CJ_FACETS) {
         for (const cb of facetBoxes(facet.key)) {
@@ -284,6 +287,7 @@ function appendCommercialFilters(params) {
     if (cjSalaryMin.value) params.set('salary_min', cjSalaryMin.value);
     if (cjExcludeNcr.checked) params.set('exclude_ncr', '1');
     if (cjRemote.checked) params.set('remote', '1');
+    if (cjPosted.value) params.set('max_age_days', cjPosted.value);
 
     for (const facet of CJ_FACETS) {
         const boxes = facetBoxes(facet.key);

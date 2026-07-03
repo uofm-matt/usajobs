@@ -220,6 +220,17 @@ class TestBuildWhere:
         where, _ = _build_where()
         assert "TELECOMMUTE" not in where
 
+    def test_max_age_days_narrows_with_bound_param(self):
+        where, params = _build_where(max_age_days=30)
+        assert "make_interval(days => $1)" in where
+        assert "left(data->>'datePosted', 10) >=" in where
+        assert params == [30]
+
+    def test_max_age_days_off_by_default(self):
+        where, params = _build_where()
+        assert "make_interval" not in where
+        assert params == []
+
     def test_exclude_ncr_filters_on_materialized_locality(self):
         where, params = _build_where(exclude_ncr=True)
         # Keep a job unless EVERY geocoded location is in the DC locality area:
@@ -766,6 +777,7 @@ def _map_row(**over):
         "label": "Denver, CO",
         "lat": 39.7392,
         "lon": -104.9903,
+        "match_total": 1,
     }
     row.update(over)
     return row
@@ -790,7 +802,14 @@ class TestMapEndpoint:
         assert r.status_code == 200
         body = r.json()
         assert body["type"] == "FeatureCollection"
-        assert body["metadata"] == {"total": 0, "clustered": False, "zoom": 6}
+        assert body["metadata"] == {
+            "total": 0,
+            "returned": 0,
+            "capped": False,
+            "cap": 6000,
+            "clustered": False,
+            "zoom": 6,
+        }
         assert body["features"] == []
 
     async def test_bbox_and_active_sql(self, client):

@@ -21,9 +21,9 @@ router = APIRouter()
 LIMIT_DEFAULT = 25
 LIMIT_MAX = 100
 # Map endpoint returns raw points (job_locations has no geometry column, and each
-# point carries its own popup payload); cap the page like the federal endpoint's
-# individual path rather than clustering.
-MAP_LIMIT = 2000
+# point carries its own popup payload) rather than clustering. The response reports
+# the true pre-cap total so the UI can flag when a zoomed-out viewport exceeds it.
+MAP_LIMIT = 6000
 
 _SALARY_MIN = "data->'baseSalary'->'value'->>'minValue'"
 _SALARY_MAX = "data->'baseSalary'->'value'->>'maxValue'"
@@ -171,6 +171,7 @@ def _build_where(
     loc=None,
     exclude_ncr=False,
     remote=False,
+    max_age_days=None,
 ) -> tuple[str, list]:
     """WHERE clause + $N-bound params for active CJ postings with detail data.
 
@@ -268,6 +269,14 @@ def _build_where(
             "OR data->>'title' ILIKE '%telecommute%' "
             "OR data->>'title' ILIKE '%telework%')"
         )
+    if max_age_days is not None:
+        # Narrower than the 6-month base cut: keep only postings within N days.
+        # Lexicographic compare on the ISO date prefix, per-request now().
+        params.append(max_age_days)
+        clauses.append(
+            f"left(data->>'datePosted', 10) >= "
+            f"to_char(now() - make_interval(days => ${len(params)}), 'YYYY-MM-DD')"
+        )
 
     return " AND ".join(clauses), params
 
@@ -359,6 +368,7 @@ async def get_commercial_jobs(
     loc: Annotated[list[str] | None, Query()] = None,
     exclude_ncr: Annotated[bool, Query()] = False,
     remote: Annotated[bool, Query()] = False,
+    max_age_days: Annotated[int | None, Query(ge=1, le=180)] = None,
     sort: Annotated[str, Query()] = "posted",
     order: Annotated[str, Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
@@ -389,6 +399,7 @@ async def get_commercial_jobs(
         loc=loc,
         exclude_ncr=exclude_ncr,
         remote=remote,
+        max_age_days=max_age_days,
     )
 
     pool = get_pool()
@@ -449,6 +460,7 @@ async def get_commercial_map(
     loc: Annotated[list[str] | None, Query()] = None,
     exclude_ncr: Annotated[bool, Query()] = False,
     remote: Annotated[bool, Query()] = False,
+    max_age_days: Annotated[int | None, Query(ge=1, le=180)] = None,
 ):
     """Map points for the same active+filtered CJ set as /api/commercial/jobs.
 
@@ -478,6 +490,7 @@ async def get_commercial_map(
         loc=loc,
         exclude_ncr=exclude_ncr,
         remote=remote,
+        max_age_days=max_age_days,
     )
     n = len(params)
     params.extend([west, south, east, north])
@@ -509,7 +522,8 @@ async def get_commercial_map(
             m.{_SALARY_MIN} AS salary_min,
             m.{_SALARY_MAX} AS salary_max,
             {_label_expr("lo")} AS label,
-            lo.lat AS lat, lo.lon AS lon
+            lo.lat AS lat, lo.lon AS lon,
+            count(*) OVER () AS match_total
         FROM matched m
         JOIN commercial.job_locations lo
           ON lo.source = m.source AND lo.ext_id = m.ext_id
@@ -525,9 +539,19 @@ async def get_commercial_map(
         rows = await conn.fetch(sql, *params)
 
     features = [_map_feature(r) for r in rows]
+    # match_total is the pre-LIMIT point count (window function), so the UI can
+    # tell when the viewport holds more than the cap returned and prompt a zoom.
+    total = rows[0]["match_total"] if rows else 0
     return {
         "type": "FeatureCollection",
-        "metadata": {"total": len(features), "clustered": False, "zoom": zoom},
+        "metadata": {
+            "total": total,
+            "returned": len(features),
+            "capped": total > len(features),
+            "cap": MAP_LIMIT,
+            "clustered": False,
+            "zoom": zoom,
+        },
         "features": features,
     }
 

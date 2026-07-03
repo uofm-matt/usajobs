@@ -7,3 +7,8 @@ __pycache__/
 .coverage
 Locality Pay Area Definitions.html
 Locality Pay Area Definitions_files/
+
+# Personal documents and private match output — never commit
+*.pdf
+Resume*
+resume_matches/

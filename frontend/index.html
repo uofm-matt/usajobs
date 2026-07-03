@@ -133,6 +133,16 @@
                 <label for="cj-filter-location">Location</label>
                 <input type="text" id="cj-filter-location" placeholder="City or state">
 
+                <label for="cj-filter-posted">Posted within</label>
+                <select id="cj-filter-posted">
+                    <option value="">Any (last 6 months)</option>
+                    <option value="30">Last 30 days</option>
+                    <option value="14">Last 14 days</option>
+                    <option value="7">Last 7 days</option>
+                    <option value="3">Last 3 days</option>
+                    <option value="1">Last 24 hours</option>
+                </select>
+
                 <label for="cj-filter-salary-min">Salary floor ($)</label>
                 <input type="number" id="cj-filter-salary-min" min="0" step="1000" placeholder="Min">
 
