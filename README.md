@@ -29,7 +29,7 @@ collector that sweeps the USAJobs Search API on an hourly full sweep.
 - `cj_collect.py` — ClearanceJobs ingester into the separate `commercial`
   schema (sitemap-driven sightings + rate-limited detail fetches; collected
   data is personal-use only and never republished).
-- `migrations/` — ordered SQL migrations (01–11). `schema.sql` is a snapshot
+- `migrations/` — ordered SQL migrations (01–12). `schema.sql` is a snapshot
   of the live schema; usable as the baseline for a fresh database (see
   Database setup).
 - `scripts/analyze_jobs.py` — offline posting analysis via the Claude API
@@ -43,9 +43,9 @@ Requires PostgreSQL 17 with PostGIS. Two setup paths:
 
 - Fresh database: create the `usajobs` database and the two app roles, then
   apply `schema.sql` as the baseline — it is a snapshot of the live schema
-  (regenerated 2026-07-02) and already includes everything migrations 01–11
+  (regenerated 2026-07-02) and already includes everything migrations 01–12
   produce. Do not also run the migrations afterwards.
-- Existing database: apply `migrations/01` … `migrations/11` in order and skip
+- Existing database: apply `migrations/01` … `migrations/12` in order and skip
   `schema.sql`.
 
 Fresh-database walkthrough (as a superuser):

@@ -959,3 +959,25 @@ CREATE INDEX IF NOT EXISTS idx_commercial_job_locations_locality
     ON commercial.job_locations(locality_area);
 
 GRANT SELECT ON public.us_counties, public.locality_areas TO usajobs_collector;
+
+-- ============================================================
+-- location_audit (migration 12) — durable location-verification results,
+-- consulted by cj_collect to re-apply same-name-city repairs on every fetch.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS commercial.location_audit (
+    source        TEXT NOT NULL,
+    ext_id        TEXT NOT NULL,
+    verdict       TEXT NOT NULL,          -- correct | mislabel | unclear
+    confidence    TEXT,                   -- high | medium | low
+    real_city     TEXT,                   -- corrected location (mislabel only)
+    real_region   TEXT,
+    real_country  TEXT,
+    reason        TEXT,
+    model         TEXT,                   -- ladder tier that settled it
+    checked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source, ext_id)
+);
+
+GRANT SELECT, INSERT, UPDATE ON commercial.location_audit TO usajobs_collector;
+GRANT SELECT ON commercial.location_audit TO usajobs_web;

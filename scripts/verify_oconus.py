@@ -9,8 +9,13 @@ escalating model cascade: Haiku settles the easy calls; anything uncertain, or a
 proposed mislabel (the actionable verdict), climbs Sonnet -> Opus -> Fable until two
 adjacent tiers agree with high confidence, or Fable has the final say.
 
-Read-only: it reports; it does not write repairs. Auth uses the local Claude Code
-OAuth token (macOS keychain), so no ANTHROPIC_API_KEY is needed.
+Without --repair it only reports. With --repair it writes each verdict to
+commercial.location_audit (incremental — already-audited postings are skipped) and,
+for confirmed two-tier-agreed high-confidence mislabels, rewrites the pin to the
+corrected US location; the collector re-applies those overrides on every future
+fetch. Auth uses the local Claude Code OAuth token (macOS keychain), so no
+ANTHROPIC_API_KEY is needed — which is also why the LLM pass runs here, not in the
+server cron.
 """
 
 import argparse
@@ -26,6 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+SOURCE = "clearancejobs"
 
 # Escalation ladder: (model, input $/M, output $/M). A suspect starts at the top of
 # this list and climbs only as far as it must to be resolved.
@@ -129,14 +135,17 @@ def _resolved(cur: dict, prev: dict | None) -> bool:
         return False
     if cur["verdict"] == "correct":
         return True
-    return prev is not None and prev["verdict"] == "mislabel"
+    return bool(prev) and prev.get("verdict") == "mislabel"
 
 
 def _escalate(
     client: anthropic.Anthropic, row: dict, cost: dict[str, list[int]]
-) -> tuple[dict, list[str]]:
-    """Climb the ladder until a verdict resolves, or Fable has the last word."""
-    prev, path = None, []
+) -> tuple[dict, list[str], bool]:
+    """Climb the ladder until a verdict resolves, or Fable has the last word.
+    The bool is True when two adjacent tiers agreed (a confirmed result safe to act
+    on), False when Fable arbitrated a tie (contested — flag, don't auto-repair)."""
+    prev: dict = {}
+    path: list[str] = []
     for model, *_ in LADDER:
         cur, usage = _classify(client, model, row)
         cost[model][0] += usage.input_tokens
@@ -145,22 +154,99 @@ def _escalate(
             f"{model.split('-')[1]}:{cur['verdict'][:4]}/{cur['confidence'][0]}"
         )
         if _resolved(cur, prev):
-            return cur, path
+            return cur, path, True
         prev = cur
-    return prev, path  # settled at Fable (final arbiter)
+    return prev, path, False  # Fable had the final, unconfirmed say
+
+
+def _parse_real(real: str | None) -> tuple[str | None, str | None, str | None]:
+    """Split an LLM real_location into (city, region, country). "Melbourne, FL" ->
+    (Melbourne, FL, United States); a bare "United States ..." -> (None, None,
+    United States); anything else -> all None (audited, but nothing to geocode)."""
+    if not real:
+        return None, None, None
+    parts = [p.strip() for p in real.split(",")]
+    if len(parts) == 2 and len(parts[1]) == 2 and parts[1].isalpha():
+        return parts[0], parts[1].upper(), "United States"
+    if "united states" in real.lower():
+        return None, None, "United States"
+    return None, None, None
+
+
+def _write_audit(
+    cur, ext_id: str, v: dict, model: str
+) -> tuple[str | None, str | None]:
+    city, region, country = _parse_real(v.get("real_location"))
+    cur.execute(
+        "INSERT INTO commercial.location_audit (source, ext_id, verdict, confidence,"
+        " real_city, real_region, real_country, reason, model) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (source, ext_id) DO UPDATE SET verdict = EXCLUDED.verdict, "
+        "confidence = EXCLUDED.confidence, real_city = EXCLUDED.real_city, "
+        "real_region = EXCLUDED.real_region, real_country = EXCLUDED.real_country, "
+        "reason = EXCLUDED.reason, model = EXCLUDED.model, checked_at = now()",
+        (SOURCE, ext_id, v["verdict"], v["confidence"], city, region, country,
+         v.get("reason"), model),
+    )  # fmt: skip
+    return city, region
+
+
+def _repair_location(cur, ext_id: str, city: str, region: str) -> bool:
+    """Rewrite job_locations for a confirmed mislabel: drop the wrong (foreign) rows
+    and insert one geocoded US row for the corrected city. Returns True when a pin
+    landed (city found in the gazetteer)."""
+    cur.execute(
+        "DELETE FROM commercial.job_locations WHERE source = %s AND ext_id = %s",
+        (SOURCE, ext_id),
+    )
+    cur.execute(
+        "INSERT INTO commercial.job_locations (source, ext_id, seq, city, region, "
+        "country, lat, lon, geocode_method, county_fips, locality_area) "
+        "SELECT %s, %s, 0, %s, %s, 'United States', gc.lat, gc.lon, 'repair', "
+        "c.fips, la.locality FROM commercial.geo_cities gc "
+        "LEFT JOIN public.us_counties c "
+        "  ON ST_Contains(c.geom, ST_SetSRID(ST_MakePoint(gc.lon, gc.lat), 4326)) "
+        "LEFT JOIN public.locality_areas la ON la.fips = c.fips "
+        "WHERE gc.country = 'US' AND lower(gc.ascii_name) = lower(%s) "
+        "AND gc.admin1 = %s ORDER BY gc.population DESC NULLS LAST LIMIT 1",
+        (SOURCE, ext_id, city, region, city, region),
+    )
+    if cur.rowcount:
+        return True
+    # No gazetteer match — still drop the wrong foreign pin, keep a city/region row.
+    cur.execute(
+        "INSERT INTO commercial.job_locations "
+        "(source, ext_id, seq, city, region, country) "
+        "VALUES (%s, %s, 0, %s, %s, 'United States')",
+        (SOURCE, ext_id, city, region),
+    )
+    return False
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, help="Cap the number of suspects checked")
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Write audit rows and repair confirmed high-confidence mislabels",
+    )
     args = parser.parse_args()
 
-    conn = psycopg2.connect(os.environ["DATABASE_URL_WEB"])
+    url = "DATABASE_URL_COLLECTOR" if args.repair else "DATABASE_URL_WEB"
+    conn = psycopg2.connect(os.environ[url])
+    conn.autocommit = False
     with conn.cursor() as cur:
         cur.execute(SUSPECTS_SQL)
         cols = [c.name for c in cur.description]
         rows = [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
-    conn.close()
+        if args.repair:  # incremental: skip suspects already audited
+            cur.execute(
+                "SELECT ext_id FROM commercial.location_audit WHERE source = %s",
+                (SOURCE,),
+            )
+            done = {r[0] for r in cur.fetchall()}
+            rows = [r for r in rows if r["ext_id"] not in done]
     if args.limit:
         rows = rows[: args.limit]
 
@@ -169,32 +255,50 @@ def main() -> None:
         default_headers={"anthropic-beta": "oauth-2025-04-20"},
     )
 
-    print(
-        f"Escalating {len(rows)} suspects through {' -> '.join(m[0].split('-')[1] for m in LADDER)}\n"
-    )
+    mode = "repairing" if args.repair else "checking"
+    ladder = " -> ".join(m[0].split("-")[1] for m in LADDER)
+    print(f"{mode.title()} {len(rows)} suspects through {ladder}\n")
     verdicts: dict[str, int] = defaultdict(int)
     top_tier: dict[str, int] = defaultdict(int)
     cost: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    repaired = 0
 
     for i, row in enumerate(rows, 1):
-        v, path = _escalate(client, row, cost)
+        v, path, settled = _escalate(client, row, cost)
         verdicts[v["verdict"]] += 1
         top_tier[path[-1].split(":")[0]] += 1
+        note = ""
+        if args.repair:
+            with conn.cursor() as cur:
+                city, region = _write_audit(
+                    cur, row["ext_id"], v, path[-1].split(":")[0]
+                )
+                # Repair only confirmed (two-tier-agreed) high-confidence mislabels.
+                if settled and v["verdict"] == "mislabel" and city and region:
+                    pinned = _repair_location(cur, row["ext_id"], city, region)
+                    repaired += 1
+                    note = f"  ✅ repaired -> {city}, {region}" + (
+                        "" if pinned else " (no pin)"
+                    )
+                conn.commit()
         flag = "🚩" if v["verdict"] == "mislabel" else "  "
         fix = f" -> {v['real_location']}" if v.get("real_location") else ""
         tiers = f"  [{' > '.join(path)}]" if len(path) > 1 else ""
         print(
             f"{flag} [{i}/{len(rows)}] {row['title'][:50]}\n"
             f"     {row['city']}, {row['country']}  |  {v['verdict']} "
-            f"({v['confidence']}){fix}{tiers}\n"
+            f"({v['confidence']}){fix}{tiers}{note}\n"
             f"     {v['reason']}  {row['url']}"
         )
+    conn.close()
 
     total = sum(
         (i * ip + o * op) / 1_000_000 for (m, ip, op) in LADDER for i, o in [cost[m]]
     )
     print(f"\n{'=' * 64}")
     print(f"Verdicts: {dict(verdicts)}")
+    if args.repair:
+        print(f"Repaired: {repaired} confirmed mislabels")
     print(f"Resolved at tier: {dict(top_tier)}")
     for m, ip, op in LADDER:
         i, o = cost[m]
